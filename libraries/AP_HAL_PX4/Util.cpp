@@ -11,7 +11,7 @@
 #include "UARTDriver.h"
 #include <uORB/uORB.h>
 #include <uORB/topics/safety.h>
-#include <systemlib/otp.h>
+#include <systemlib/board_serial.h>
 
 extern const AP_HAL::HAL& hal;
 
@@ -23,7 +23,7 @@ extern bool _px4_thread_should_exit;
 /*
   constructor
  */
-PX4Util::PX4Util(void) 
+PX4Util::PX4Util(void) : Util()
 {
     _safety_handle = orb_subscribe(ORB_ID(safety));
 }
@@ -105,7 +105,7 @@ bool PX4Util::get_system_id(char buf[40])
 {
     uint8_t serialid[12];
     memset(serialid, 0, sizeof(serialid));
-    val_read(serialid, (const void *)UDID_START, sizeof(serialid));
+    get_board_serial(serialid);
 #ifdef CONFIG_ARCH_BOARD_PX4FMU_V1
     const char *board_type = "PX4v1";
 #else

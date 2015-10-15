@@ -7,6 +7,9 @@
 #include "Scheduler.h"
 #include <sys/time.h>
 #include <unistd.h>
+#include <fenv.h>
+#include <signal.h>
+#include <pthread.h>
 
 #ifdef __CYGWIN__
 #include <stdio.h> 
@@ -43,8 +46,17 @@ double SITLScheduler::_cyg_freq = 0;
 long SITLScheduler::_cyg_start = 0;
 #endif
 
-SITLScheduler::SITLScheduler()
-{}
+static void sigcont_handler(int)
+{
+}
+
+SITLScheduler::SITLScheduler(SITL_State *sitlState) :
+    _sitlState(sitlState),
+    stopped_clock_usec(0)
+{
+    signal(SIGCONT, sigcont_handler);
+    pthread_barrier_init(&clock_barrier, NULL, 2);
+}
 
 void SITLScheduler::init(void *unused) 
 {
@@ -70,56 +82,81 @@ double SITLScheduler::_cyg_sec()
 }
 #endif
 
-uint32_t SITLScheduler::_micros() 
+uint64_t SITLScheduler::_micros64() 
 {
 #ifdef __CYGWIN__
-	return (uint32_t)(_cyg_sec() * 1.0e6);
+	return (uint64_t)(_cyg_sec() * 1.0e6);
 #else   
 	struct timeval tp;
 	gettimeofday(&tp,NULL);
-	return 1.0e6*((tp.tv_sec + (tp.tv_usec*1.0e-6)) - 
-		      (_sketch_start_time.tv_sec +
-		       (_sketch_start_time.tv_usec*1.0e-6)));
+	uint64_t ret = 1.0e6*((tp.tv_sec + (tp.tv_usec*1.0e-6)) - 
+                          (_sketch_start_time.tv_sec +
+                           (_sketch_start_time.tv_usec*1.0e-6)));
+    return ret;
 #endif
+}
+
+uint64_t SITLScheduler::micros64() 
+{
+    if (stopped_clock_usec) {
+        return stopped_clock_usec;
+    }
+    return _micros64();
 }
 
 uint32_t SITLScheduler::micros() 
 {
-    return _micros();
+    return micros64() & 0xFFFFFFFF;
+}
+
+uint64_t SITLScheduler::millis64() 
+{
+    if (stopped_clock_usec) {
+        return stopped_clock_usec/1000;
+    }
+#ifdef __CYGWIN__
+	// 1000 ms in a second
+	return (uint64_t)(_cyg_sec() * 1000);
+#else
+	struct timeval tp;
+	gettimeofday(&tp,NULL);
+	uint64_t ret = 1.0e3*((tp.tv_sec + (tp.tv_usec*1.0e-6)) - 
+                          (_sketch_start_time.tv_sec +
+                           (_sketch_start_time.tv_usec*1.0e-6)));
+    return ret;
+#endif
 }
 
 uint32_t SITLScheduler::millis() 
 {
-#ifdef __CYGWIN__
-	// 1000 ms in a second
-	return (uint32_t)(_cyg_sec() * 1000);
-#else
-	struct timeval tp;
-	gettimeofday(&tp,NULL);
-	return 1.0e3*((tp.tv_sec + (tp.tv_usec*1.0e-6)) - 
-		      (_sketch_start_time.tv_sec +
-		       (_sketch_start_time.tv_usec*1.0e-6)));
-#endif
+    return millis64() & 0xFFFFFFFF;
 }
+
+extern AVR_SITL::SITL_State *g_state;
+
 
 void SITLScheduler::delay_microseconds(uint16_t usec) 
 {
-	uint32_t start = micros();
-	while (micros() - start < usec) {
-		usleep(usec - (micros() - start));
+	uint64_t start = micros64();
+    uint64_t dtime;
+	while ((dtime=(micros64() - start) < usec)) {
+        if (stopped_clock_usec) {
+            /*
+              we are using a synthetic clock. We want to wait until
+              the stop_clock() call advances the clock
+             */
+            pthread_barrier_wait(&clock_barrier);
+        } else {
+            usleep(usec - dtime);
+        }
 	}
 }
 
 void SITLScheduler::delay(uint16_t ms)
 {
-	uint32_t start = micros();
-    
     while (ms > 0) {
-        while ((micros() - start) >= 1000) {
-            ms--;
-            if (ms == 0) break;
-            start += 1000;
-        }
+        delay_microseconds(1000);
+        ms--;
         if (_min_delay_cb_ms <= ms) {
             if (_delay_cb) {
                 _delay_cb();
@@ -195,6 +232,11 @@ void SITLScheduler::system_initialized() {
         panic(
             PSTR("PANIC: scheduler system initialized called more than once"));
     }
+    if (_sitlState->_sitl == NULL || _sitlState->_sitl->float_exception) {
+        feenableexcept(FE_INVALID | FE_OVERFLOW | FE_DIVBYZERO);
+    } else {
+        feclearexcept(FE_INVALID | FE_OVERFLOW | FE_DIVBYZERO);
+    }
     _initialized = true;
 }
 
@@ -243,7 +285,7 @@ void SITLScheduler::_run_timer_procs(bool called_from_isr)
 
     // and the failsafe, if one is setup
     if (_failsafe != NULL) {
-        //_failsafe(NULL);
+        _failsafe();
     }
 
     _in_timer_proc = false;
@@ -273,6 +315,26 @@ void SITLScheduler::_run_io_procs(bool called_from_isr)
 void SITLScheduler::panic(const prog_char_t *errormsg) {
     hal.console->println_P(errormsg);
     for(;;);
+}
+
+/*
+  set simulation timestamp
+ */
+void SITLScheduler::stop_clock(uint64_t time_usec)
+{
+    if (stopped_clock_usec != 0) {
+        /*
+          wait until the main thread is waiting for us. This ensures
+          that any processing is complete before we advance the clock
+         */
+        pthread_barrier_wait(&clock_barrier);
+    }
+    stopped_clock_usec = time_usec;
+    /*
+      wait again to ensure the main thread can't get behind the FDM
+     */
+    pthread_barrier_wait(&clock_barrier);
+    _run_io_procs(false);
 }
 
 #endif

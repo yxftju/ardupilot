@@ -19,13 +19,14 @@ static int8_t   test_airspeed(uint8_t argc,     const Menu::arg *argv);
 static int8_t   test_pressure(uint8_t argc,     const Menu::arg *argv);
 static int8_t   test_mag(uint8_t argc,                  const Menu::arg *argv);
 static int8_t   test_xbee(uint8_t argc,                 const Menu::arg *argv);
-static int8_t   test_eedump(uint8_t argc,               const Menu::arg *argv);
-static int8_t   test_rawgps(uint8_t argc,                       const Menu::arg *argv);
 static int8_t   test_modeswitch(uint8_t argc,           const Menu::arg *argv);
 static int8_t   test_logging(uint8_t argc,              const Menu::arg *argv);
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
 static int8_t   test_shell(uint8_t argc,              const Menu::arg *argv);
 #endif
+
+// forward declaration to keep the compiler happy
+static void test_wp_print(const AP_Mission::Mission_Command& cmd);
 
 // Creates a constant array of structs representing menu options
 // and stores them in Flash memory, not RAM.
@@ -39,28 +40,20 @@ static const struct Menu::command test_menu_commands[] PROGMEM = {
     {"relay",                       test_relay},
     {"waypoints",           test_wp},
     {"xbee",                        test_xbee},
-    {"eedump",                      test_eedump},
     {"modeswitch",          test_modeswitch},
 
     // Tests below here are for hardware sensors only present
     // when real sensors are attached or they are emulated
-#if HIL_MODE == HIL_MODE_DISABLED
- #if CONFIG_HAL_BOARD == HAL_BOARD_APM1
+#if CONFIG_HAL_BOARD == HAL_BOARD_APM1
     {"adc",                 test_adc},
- #endif
+#endif
     {"gps",                 test_gps},
-    {"rawgps",              test_rawgps},
     {"ins",                 test_ins},
     {"airspeed",    test_airspeed},
     {"airpressure", test_pressure},
     {"compass",             test_mag},
-#else
-    {"gps",                 test_gps},
-    {"ins",                 test_ins},
-    {"compass",             test_mag},
-#endif
     {"logging",             test_logging},
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
     {"shell", 				test_shell},
 #endif
 
@@ -83,28 +76,13 @@ static void print_hit_enter()
 }
 
 static int8_t
-test_eedump(uint8_t argc, const Menu::arg *argv)
-{
-    uint16_t i, j;
-
-    // hexdump the EEPROM
-    for (i = 0; i < EEPROM_MAX_ADDR; i += 16) {
-        cliSerial->printf_P(PSTR("%04x:"), i);
-        for (j = 0; j < 16; j++)
-            cliSerial->printf_P(PSTR(" %02x"), hal.storage->read_byte(i + j));
-        cliSerial->println();
-    }
-    return(0);
-}
-
-static int8_t
 test_radio_pwm(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
 
         // Filters radio input - adjust filters in the radio.pde file
         // ----------------------------------------------------------
@@ -131,13 +109,13 @@ static int8_t
 test_passthru(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
 
         // New radio frame? (we could use also if((millis()- timer) > 20)
-        if (hal.rcin->valid_channels() > 0) {
+        if (hal.rcin->new_input()) {
             cliSerial->print_P(PSTR("CH:"));
             for(int16_t i = 0; i < 8; i++) {
                 cliSerial->print(hal.rcin->read(i));        // Print channel values
@@ -157,14 +135,14 @@ static int8_t
 test_radio(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     // read the radio to set trims
     // ---------------------------
     trim_radio();
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
         read_radio();
 
         channel_roll->calc_pwm();
@@ -198,7 +176,7 @@ test_failsafe(uint8_t argc, const Menu::arg *argv)
     uint8_t fail_test;
     print_hit_enter();
     for(int16_t i = 0; i < 50; i++) {
-        delay(20);
+        hal.scheduler->delay(20);
         read_radio();
     }
 
@@ -210,12 +188,12 @@ test_failsafe(uint8_t argc, const Menu::arg *argv)
 
     cliSerial->printf_P(PSTR("Unplug battery, throttle in neutral, turn off radio.\n"));
     while(channel_throttle->control_in > 0) {
-        delay(20);
+        hal.scheduler->delay(20);
         read_radio();
     }
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
         read_radio();
 
         if(channel_throttle->control_in > 0) {
@@ -251,19 +229,19 @@ static int8_t
 test_relay(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     while(1) {
         cliSerial->printf_P(PSTR("Relay on\n"));
         relay.on(0);
-        delay(3000);
+        hal.scheduler->delay(3000);
         if(cliSerial->available() > 0) {
             return (0);
         }
 
         cliSerial->printf_P(PSTR("Relay off\n"));
         relay.off(0);
-        delay(3000);
+        hal.scheduler->delay(3000);
         if(cliSerial->available() > 0) {
             return (0);
         }
@@ -273,7 +251,7 @@ test_relay(uint8_t argc, const Menu::arg *argv)
 static int8_t
 test_wp(uint8_t argc, const Menu::arg *argv)
 {
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     // save the alitude above home option
     if (g.RTL_altitude_cm < 0) {
@@ -282,36 +260,38 @@ test_wp(uint8_t argc, const Menu::arg *argv)
         cliSerial->printf_P(PSTR("Hold altitude of %dm\n"), (int)g.RTL_altitude_cm/100);
     }
 
-    cliSerial->printf_P(PSTR("%d waypoints\n"), (int)g.command_total);
+    cliSerial->printf_P(PSTR("%d waypoints\n"), (int)mission.num_commands());
     cliSerial->printf_P(PSTR("Hit radius: %d\n"), (int)g.waypoint_radius);
     cliSerial->printf_P(PSTR("Loiter radius: %d\n\n"), (int)g.loiter_radius);
 
-    for(uint8_t i = 0; i <= g.command_total; i++) {
-        struct Location temp = get_cmd_with_index(i);
-        test_wp_print(&temp, i);
+    for(uint8_t i = 0; i <= mission.num_commands(); i++) {
+        AP_Mission::Mission_Command temp_cmd;
+        if (mission.read_cmd_from_storage(i,temp_cmd)) {
+            test_wp_print(temp_cmd);
+        }
     }
 
     return (0);
 }
 
 static void
-test_wp_print(const struct Location *cmd, uint8_t wp_index)
+test_wp_print(const AP_Mission::Mission_Command& cmd)
 {
     cliSerial->printf_P(PSTR("command #: %d id:%d options:%d p1:%d p2:%ld p3:%ld p4:%ld \n"),
-                    (int)wp_index,
-                    (int)cmd->id,
-                    (int)cmd->options,
-                    (int)cmd->p1,
-                    (long)cmd->alt,
-                    (long)cmd->lat,
-                    (long)cmd->lng);
+                    (int)cmd.index,
+                    (int)cmd.id,
+                    (int)cmd.content.location.options,
+                    (int)cmd.p1,
+                    (long)cmd.content.location.alt,
+                    (long)cmd.content.location.lat,
+                    (long)cmd.content.location.lng);
 }
 
 static int8_t
 test_xbee(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
     cliSerial->printf_P(PSTR("Begin XBee X-CTU Range and RSSI Test:\n"));
 
     while(1) {
@@ -330,14 +310,14 @@ static int8_t
 test_modeswitch(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     cliSerial->printf_P(PSTR("Control CH "));
 
     cliSerial->println(FLIGHT_MODE_CHANNEL, BASE_DEC);
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
         uint8_t switchPosition = readSwitch();
         if (oldSwitchPosition != switchPosition) {
             cliSerial->printf_P(PSTR("Position %d\n"),  (int)switchPosition);
@@ -359,7 +339,7 @@ test_logging(uint8_t argc, const Menu::arg *argv)
     return 0;
 }
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
 /*
  *  run a debug shell
  */
@@ -374,45 +354,48 @@ test_shell(uint8_t argc, const Menu::arg *argv)
 //-------------------------------------------------------------------------------------------
 // tests in this section are for real sensors or sensors that have been simulated
 
-#if CONFIG_INS_TYPE == CONFIG_INS_OILPAN || CONFIG_HAL_BOARD == HAL_BOARD_APM1
+#if CONFIG_HAL_BOARD == HAL_BOARD_APM1
 static int8_t
 test_adc(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
     apm1_adc.Init();
-    delay(1000);
+    hal.scheduler->delay(1000);
     cliSerial->printf_P(PSTR("ADC\n"));
-    delay(1000);
+    hal.scheduler->delay(1000);
 
     while(1) {
         for (int8_t i=0; i<9; i++) cliSerial->printf_P(PSTR("%.1f\t"),apm1_adc.Ch(i));
         cliSerial->println();
-        delay(100);
+        hal.scheduler->delay(100);
         if(cliSerial->available() > 0) {
             return (0);
         }
     }
 }
-#endif // CONFIG_INS_TYPE
+#endif
 
 static int8_t
 test_gps(uint8_t argc, const Menu::arg *argv)
 {
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
 
+    uint32_t last_message_time_ms = 0;
     while(1) {
-        delay(100);
+        hal.scheduler->delay(100);
 
-        g_gps->update();
+        gps.update();
 
-        if (g_gps->new_data) {
+        if (gps.last_message_time_ms() != last_message_time_ms) {
+            last_message_time_ms = gps.last_message_time_ms();
+            const Location &loc = gps.location();
             cliSerial->printf_P(PSTR("Lat: %ld, Lon %ld, Alt: %ldm, #sats: %d\n"),
-                            (long)g_gps->latitude,
-                            (long)g_gps->longitude,
-                            (long)g_gps->altitude_cm/100,
-                            (int)g_gps->num_sats);
-        }else{
+                                (long)loc.lat,
+                                (long)loc.lng,
+                                (long)loc.alt/100,
+                                (int)gps.num_sats());
+        } else {
             cliSerial->printf_P(PSTR("."));
         }
         if(cliSerial->available() > 0) {
@@ -434,12 +417,12 @@ test_ins(uint8_t argc, const Menu::arg *argv)
     ahrs.reset();
 
     print_hit_enter();
-    delay(1000);
+    hal.scheduler->delay(1000);
     
     uint8_t counter = 0;
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
         if (hal.scheduler->micros() - fast_loopTimer_us > 19000UL) {
             fast_loopTimer_us       = hal.scheduler->micros();
 
@@ -503,7 +486,7 @@ test_mag(uint8_t argc, const Menu::arg *argv)
     print_hit_enter();
 
     while(1) {
-        delay(20);
+        hal.scheduler->delay(20);
         if (hal.scheduler->micros() - fast_loopTimer_us > 19000UL) {
             fast_loopTimer_us       = hal.scheduler->micros();
 
@@ -550,8 +533,6 @@ test_mag(uint8_t argc, const Menu::arg *argv)
 //-------------------------------------------------------------------------------------------
 // real sensors that have not been simulated yet go here
 
-#if HIL_MODE == HIL_MODE_DISABLED
-
 static int8_t
 test_airspeed(uint8_t argc, const Menu::arg *argv)
 {
@@ -561,12 +542,12 @@ test_airspeed(uint8_t argc, const Menu::arg *argv)
         return (0);
     }else{
         print_hit_enter();
-        zero_airspeed();
+        zero_airspeed(false);
         cliSerial->printf_P(PSTR("airspeed: "));
         print_enabled(true);
 
         while(1) {
-            delay(20);
+            hal.scheduler->delay(20);
             read_airspeed();
             cliSerial->printf_P(PSTR("%.1f m/s\n"), airspeed.get_airspeed());
 
@@ -587,9 +568,10 @@ test_pressure(uint8_t argc, const Menu::arg *argv)
     init_barometer();
 
     while(1) {
-        delay(100);
+        hal.scheduler->delay(100);
+        barometer.update();
 
-        if (!barometer.healthy) {
+        if (!barometer.healthy()) {
             cliSerial->println_P(PSTR("not healthy"));
         } else {
             cliSerial->printf_P(PSTR("Alt: %0.2fm, Raw: %f Temperature: %.1f\n"),
@@ -603,27 +585,5 @@ test_pressure(uint8_t argc, const Menu::arg *argv)
         }
     }
 }
-
-static int8_t
-test_rawgps(uint8_t argc, const Menu::arg *argv)
-{
-    print_hit_enter();
-    delay(1000);
-
-    while(1) {
-        // Blink Yellow LED if we are sending data to GPS
-        if (hal.uartC->available()) {
-            hal.uartB->write(hal.uartC->read());
-        }
-        // Blink Red LED if we are receiving data from GPS
-        if (hal.uartB->available()) {
-            hal.uartC->write(hal.uartB->read());
-        }
-        if(cliSerial->available() > 0) {
-            return (0);
-        }
-    }
-}
-#endif // HIL_MODE == HIL_MODE_DISABLED
 
 #endif // CLI_ENABLED

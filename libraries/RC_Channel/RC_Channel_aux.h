@@ -7,9 +7,14 @@
 #ifndef __RC_CHANNEL_AUX_H__
 #define __RC_CHANNEL_AUX_H__
 
+#include <AP_HAL.h>
 #include "RC_Channel.h"
 
+#if HAL_CPU_CLASS > HAL_CPU_CLASS_16
+#define RC_AUX_MAX_CHANNELS 12
+#else
 #define RC_AUX_MAX_CHANNELS 8
+#endif
 
 /// @class	RC_Channel_aux
 /// @brief	Object managing one aux. RC channel (CH5-8), with information about its function
@@ -60,15 +65,26 @@ public:
         k_sprayer_spinner       = 23,            ///< crop sprayer spinner channel
         k_flaperon1             = 24,            ///< flaperon, left wing
         k_flaperon2             = 25,            ///< flaperon, right wing
+        k_steering              = 26,            ///< ground steering, used to separate from rudder
+        k_parachute_release     = 27,            ///< parachute release
+        k_epm                   = 28,            ///< epm gripper
+        k_landing_gear_control  = 29,            ///< landing gear controller
         k_nr_aux_servo_functions         ///< This must be the last enum value (only add new values _before_ this one)
     } Aux_servo_function_t;
 
     AP_Int8         function;           ///< see Aux_servo_function_t enum
 
-    void            output_ch(unsigned char ch_nr);
+    // output one auxillary channel
+    void            output_ch(void);
+
+    // output all auxillary channels
+    static void     output_ch_all(void);
 
 	// set radio_out for a function channel
 	static void set_radio(Aux_servo_function_t function, int16_t value);
+
+	// set radio_out for all channels matching the given function type, allow radio_trim to center servo
+	static void set_radio_trimmed(Aux_servo_function_t function, int16_t value);
 
 	// set and save the trim for a function channel to radio_in
 	static void set_radio_trim(Aux_servo_function_t function);
@@ -88,6 +104,12 @@ public:
 	// set servo_out
 	static void set_servo_out(Aux_servo_function_t function, int16_t value);
 
+	// setup failsafe for an auxillary channel function
+	static void set_servo_failsafe(Aux_servo_function_t function, RC_Channel::LimitValue limit);
+
+	// set servo to a LimitValue
+	static void set_servo_limit(Aux_servo_function_t function, RC_Channel::LimitValue limit);
+
 	// return true if a function is assigned to a channel
 	static bool function_assigned(Aux_servo_function_t function);
 
@@ -102,6 +124,9 @@ public:
     
     // prevent a channel from being used for auxillary functions
     static void disable_aux_channel(uint8_t channel);
+
+    // return the current function for a channel
+    static Aux_servo_function_t channel_function(uint8_t channel);
 
 private:
     static uint32_t _function_mask;

@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <time.h>
 #include <dirent.h>
+#include "../AP_HAL/utility/RingBuffer.h"
 
 extern const AP_HAL::HAL& hal;
 
@@ -39,11 +40,24 @@ DataFlash_File::DataFlash_File(const char *log_directory) :
     _read_offset(0),
     _write_offset(0),
     _initialised(false),
+    _open_error(false),
     _log_directory(log_directory),
     _writebuf(NULL),
     _writebuf_size(16*1024),
-#ifdef CONFIG_ARCH_BOARD_PX4FMU_V1
+#if defined(CONFIG_ARCH_BOARD_PX4FMU_V1)
     // V1 gets IO errors with larger than 512 byte writes
+    _writebuf_chunk(512),
+#elif defined(CONFIG_ARCH_BOARD_VRBRAIN_V45)
+    _writebuf_chunk(512),
+#elif defined(CONFIG_ARCH_BOARD_VRBRAIN_V51)
+    _writebuf_chunk(512),
+#elif defined(CONFIG_ARCH_BOARD_VRBRAIN_V52)
+    _writebuf_chunk(512),
+#elif defined(CONFIG_ARCH_BOARD_VRUBRAIN_V51)
+    _writebuf_chunk(512),
+#elif defined(CONFIG_ARCH_BOARD_VRUBRAIN_V52)
+    _writebuf_chunk(512),
+#elif defined(CONFIG_ARCH_BOARD_VRHERO_V10)
     _writebuf_chunk(512),
 #else
     _writebuf_chunk(4096),
@@ -51,7 +65,7 @@ DataFlash_File::DataFlash_File(const char *log_directory) :
     _writebuf_head(0),
     _writebuf_tail(0),
     _last_write_time(0)
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
     ,_perf_write(perf_alloc(PC_ELAPSED, "DF_write")),
     _perf_fsync(perf_alloc(PC_ELAPSED, "DF_fsync")),
     _perf_errors(perf_alloc(PC_COUNT, "DF_errors"))
@@ -67,7 +81,7 @@ void DataFlash_File::Init(const struct LogStructure *structure, uint8_t num_type
     int ret;
     struct stat st;
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
     // try to cope with an existing lowercase log directory
     // name. NuttX does not handle case insensitive VFAT well
     DIR *d = opendir("/fs/microsd/APM");
@@ -93,9 +107,20 @@ void DataFlash_File::Init(const struct LogStructure *structure, uint8_t num_type
     if (_writebuf != NULL) {
         free(_writebuf);
     }
-    _writebuf = (uint8_t *)malloc(_writebuf_size);
+
+    /*
+      if we can't allocate the full writebuf then try reducing it
+      until we can allocate it
+     */
+    while (_writebuf == NULL && _writebuf_size >= _writebuf_chunk) {
+        _writebuf = (uint8_t *)malloc(_writebuf_size);
+        if (_writebuf == NULL) {
+            _writebuf_size /= 2;
+        }
+    }
     if (_writebuf == NULL) {
-        return;
+        hal.console->printf("Out of memory for logging\n");
+        return;        
     }
     _writebuf_head = _writebuf_tail = 0;
     _initialised = true;
@@ -105,7 +130,7 @@ void DataFlash_File::Init(const struct LogStructure *structure, uint8_t num_type
 // return true for CardInserted() if we successfully initialised
 bool DataFlash_File::CardInserted(void)
 {
-    return _initialised;
+    return _initialised && !_open_error;
 }
 
 
@@ -159,20 +184,10 @@ void DataFlash_File::EraseAll()
     }
 }
 
-/*
-  buffer handling macros
- */
-#define BUF_AVAILABLE(buf) ((buf##_head > (_tail=buf##_tail))? (buf##_size - buf##_head) + _tail: _tail - buf##_head)
-#define BUF_SPACE(buf) (((_head=buf##_head) > buf##_tail)?(_head - buf##_tail) - 1:((buf##_size - buf##_tail) + _head) - 1)
-#define BUF_EMPTY(buf) (buf##_head == buf##_tail)
-#define BUF_ADVANCETAIL(buf, n) buf##_tail = (buf##_tail + n) % buf##_size
-#define BUF_ADVANCEHEAD(buf, n) buf##_head = (buf##_head + n) % buf##_size
-
-
 /* Write a block of data at current offset */
 void DataFlash_File::WriteBlock(const void *pBuffer, uint16_t size)
 {
-    if (_write_fd == -1 || !_initialised || !_writes_enabled) {
+    if (_write_fd == -1 || !_initialised || _open_error || !_writes_enabled) {
         return;
     }
     uint16_t _head;
@@ -209,7 +224,7 @@ void DataFlash_File::WriteBlock(const void *pBuffer, uint16_t size)
 */
 void DataFlash_File::ReadBlock(void *pkt, uint16_t size)
 {
-    if (_read_fd == -1 || !_initialised) {
+    if (_read_fd == -1 || !_initialised || _open_error) {
         return;
     }
 
@@ -288,7 +303,7 @@ void DataFlash_File::get_log_boundaries(uint16_t log_num, uint16_t & start_page,
  */
 int16_t DataFlash_File::get_log_data(uint16_t log_num, uint16_t page, uint32_t offset, uint16_t len, uint8_t *data)
 {
-    if (!_initialised) {
+    if (!_initialised || _open_error) {
         return -1;
     }
     if (_read_fd != -1 && log_num != _read_fd_log_num) {
@@ -302,10 +317,17 @@ int16_t DataFlash_File::get_log_data(uint16_t log_num, uint16_t page, uint32_t o
         }
         stop_logging();
         _read_fd = ::open(fname, O_RDONLY);
-        free(fname);
         if (_read_fd == -1) {
+            _open_error = true;
+            int saved_errno = errno;
+            ::printf("Log read open fail for %s - %s\n",
+                     fname, strerror(saved_errno));
+            hal.console->printf("Log read open fail for %s - %s\n",
+                                fname, strerror(saved_errno));
+            free(fname);
             return -1;            
         }
+        free(fname);
         _read_offset = 0;
         _read_fd_log_num = log_num;
     }
@@ -321,8 +343,8 @@ int16_t DataFlash_File::get_log_data(uint16_t log_num, uint16_t page, uint32_t o
       bug. We can remove this once we find the real bug.
     */
     if (ofs / 4096 != (ofs+len) / 4096) {
-        int seek_current = ::lseek(_read_fd, 0, SEEK_CUR);
-        if (seek_current != _read_offset) {
+        off_t seek_current = ::lseek(_read_fd, 0, SEEK_CUR);
+        if (seek_current != (off_t)_read_offset) {
             ::lseek(_read_fd, _read_offset, SEEK_SET);
         }
     }
@@ -356,7 +378,7 @@ uint16_t DataFlash_File::get_num_logs(void)
 {
     uint16_t ret;
     uint16_t high = find_last_log();
-    for (ret=1; ret<high; ret++) {
+    for (ret=0; ret<high; ret++) {
         if (_get_log_size(high - ret) <= 0) {
             break;
         }
@@ -385,6 +407,12 @@ uint16_t DataFlash_File::start_new_log(void)
 {
     stop_logging();
 
+    if (_open_error) {
+        // we have previously failed to open a file - don't try again
+        // to prevent us trying to open files while in flight
+        return 0xFFFF;
+    }
+
     if (_read_fd != -1) {
         ::close(_read_fd);
         _read_fd = -1;
@@ -400,11 +428,18 @@ uint16_t DataFlash_File::start_new_log(void)
     }
     char *fname = _log_file_name(log_num);
     _write_fd = ::open(fname, O_WRONLY|O_CREAT|O_TRUNC, 0666);
-    free(fname);
     if (_write_fd == -1) {
         _initialised = false;
+        _open_error = true;
+        int saved_errno = errno;
+        ::printf("Log open fail for %s - %s\n",
+                 fname, strerror(saved_errno));
+        hal.console->printf("Log open fail for %s - %s\n",
+                            fname, strerror(saved_errno));
+        free(fname);
         return 0xFFFF;
     }
+    free(fname);
     _write_offset = 0;
     _writebuf_head = 0;
     _writebuf_tail = 0;
@@ -429,7 +464,7 @@ void DataFlash_File::LogReadProcess(uint16_t log_num,
                                     AP_HAL::BetterStream *port)
 {
     uint8_t log_step = 0;
-    if (!_initialised) {
+    if (!_initialised || _open_error) {
         return;
     }
     if (_read_fd != -1) {
@@ -561,7 +596,7 @@ void DataFlash_File::ListAvailableLogs(AP_HAL::BetterStream *port)
 void DataFlash_File::_io_timer(void)
 {
     uint16_t _tail;
-    if (_write_fd == -1 || !_initialised) {
+    if (_write_fd == -1 || !_initialised || _open_error) {
         return;
     }
 

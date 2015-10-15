@@ -12,6 +12,7 @@
 #include <AP_HAL_AVR_SITL.h>
 #include <AP_HAL_Empty.h>
 #include <AP_HAL_PX4.h>
+#include <AP_HAL_Linux.h>
 #include <AP_Math.h>
 #include <Filter.h>
 #include <AP_ADC.h>
@@ -23,12 +24,17 @@
 #include <AP_GPS.h>
 #include <DataFlash.h>
 #include <GCS_MAVLink.h>
+#include <AP_Mission.h>
+#include <StorageManager.h>
+#include <AP_Terrain.h>
 #include <AP_Declination.h>
 #include <AP_AHRS.h>
 #include <AP_NavEKF.h>
 #include <AP_Airspeed.h>
 #include <AP_Vehicle.h>
 #include <AP_ADC_AnalogSource.h>
+#include <AP_Rally.h>
+#include <AP_BattMonitor.h>
 
 const AP_HAL::HAL& hal = AP_HAL_BOARD_DRIVER;
 
@@ -128,7 +134,7 @@ static void test_quaternion(float roll, float pitch, float yaw)
     float roll2, pitch2, yaw2;
 
     q.from_euler(roll, pitch, yaw);
-    q.to_euler(&roll2, &pitch2, &yaw2);
+    q.to_euler(roll2, pitch2, yaw2);
     check_result("test_quaternion1", roll, pitch, yaw, roll2, pitch2, yaw2);
 
     m.from_euler(roll, pitch, yaw);
@@ -137,7 +143,7 @@ static void test_quaternion(float roll, float pitch, float yaw)
 
     m.from_euler(roll, pitch, yaw);
     q.from_rotation_matrix(m);
-    q.to_euler(&roll2, &pitch2, &yaw2);
+    q.to_euler(roll2, pitch2, yaw2);
     check_result("test_quaternion3", roll, pitch, yaw, roll2, pitch2, yaw2);
 
     q.rotation_matrix(m);
@@ -188,7 +194,7 @@ static void test_conversion(float roll, float pitch, float yaw)
     float roll3, pitch3, yaw3;
 
     q.from_euler(roll, pitch, yaw);
-    q.to_euler(&roll2, &pitch2, &yaw2);
+    q.to_euler(roll2, pitch2, yaw2);
     check_result("test_conversion1", roll, pitch, yaw, roll2, pitch2, yaw2);
 
     q.rotation_matrix(m);
@@ -234,9 +240,26 @@ void test_frame_transforms(void)
 
     hal.console->println("frame transform tests\n");
 
-    q.from_euler(ToRad(90), 0, 0);
+    q.from_euler(ToRad(45), ToRad(45), ToRad(45));
+    q.normalize();
+    m.from_euler(ToRad(45), ToRad(45), ToRad(45));
+
     v2 = v = Vector3f(0, 0, 1);
     q.earth_to_body(v2);
+    hal.console->printf("%f %f %f\n", v2.x, v2.y, v2.z);
+    v2 = m * v;
+    hal.console->printf("%f %f %f\n\n", v2.x, v2.y, v2.z);
+
+    v2 = v = Vector3f(0, 1, 0);
+    q.earth_to_body(v2);
+    hal.console->printf("%f %f %f\n", v2.x, v2.y, v2.z);
+    v2 = m * v;
+    hal.console->printf("%f %f %f\n\n", v2.x, v2.y, v2.z);
+
+    v2 = v = Vector3f(1, 0, 0);
+    q.earth_to_body(v2);
+    hal.console->printf("%f %f %f\n", v2.x, v2.y, v2.z);
+    v2 = m * v;
     hal.console->printf("%f %f %f\n", v2.x, v2.y, v2.z);
 }
 

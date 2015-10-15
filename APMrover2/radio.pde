@@ -12,6 +12,10 @@ static void set_control_channels(void)
 	// set rc channel ranges
 	channel_steer->set_angle(SERVO_MAX);
 	channel_throttle->set_angle(100);
+
+    // setup correct scaling for ESCs like the UAVCAN PX4ESC which
+    // take a proportion of speed. 
+    hal.rcout->set_esc_scaling(channel_throttle->radio_min, channel_throttle->radio_max);
 }
 
 static void init_rc_in()
@@ -26,35 +30,24 @@ static void init_rc_in()
 
 static void init_rc_out()
 {
-    for (uint8_t i=0; i<8; i++) {
-        RC_Channel::rc_channel(i)->enable_out();
-        RC_Channel::rc_channel(i)->output_trim();
-    }
+    RC_Channel::rc_channel(CH_1)->enable_out();
+    RC_Channel::rc_channel(CH_3)->enable_out();
+    RC_Channel::output_trim_all();    
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
-    servo_write(CH_9,   g.rc_9.radio_trim);
-#endif
-#if CONFIG_HAL_BOARD == HAL_BOARD_APM2 || CONFIG_HAL_BOARD == HAL_BOARD_PX4
-    servo_write(CH_10,  g.rc_10.radio_trim);
-    servo_write(CH_11,  g.rc_11.radio_trim);
-#endif
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
-    servo_write(CH_12,  g.rc_12.radio_trim);
-#endif
+    // setup PWM values to send if the FMU firmware dies
+    RC_Channel::setup_failsafe_trim_all();  
 }
 
 static void read_radio()
 {
-    if (!hal.rcin->valid_channels()) {
+    if (!hal.rcin->new_input()) {
         control_failsafe(channel_throttle->radio_in);
         return;
     }
 
     failsafe.last_valid_rc_ms = hal.scheduler->millis();
 
-    for (uint8_t i=0; i<8; i++) {
-        RC_Channel::rc_channel(i)->set_pwm(RC_Channel::rc_channel(i)->read());
-    }
+    RC_Channel::set_pwm_all();
 
 	control_failsafe(channel_throttle->radio_in);
 

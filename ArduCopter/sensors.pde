@@ -1,16 +1,5 @@
 // -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 
- #if CONFIG_SONAR == ENABLED
-static void init_sonar(void)
-{
-  #if CONFIG_SONAR_SOURCE == SONAR_SOURCE_ADC
-    sonar->calculate_scaler(g.sonar_type, 3.3f);
-  #else
-    sonar->calculate_scaler(g.sonar_type, 5.0f);
-  #endif
-}
- #endif
-
 static void init_barometer(bool full_calibration)
 {
     gcs_send_text_P(SEVERITY_LOW, PSTR("Calibrating barometer"));
@@ -23,28 +12,39 @@ static void init_barometer(bool full_calibration)
 }
 
 // return barometric altitude in centimeters
-static int32_t read_barometer(void)
+static void read_barometer(void)
 {
-    barometer.read();
-    if (g.log_bitmask & MASK_LOG_IMU) {
+    barometer.update();
+    if (should_log(MASK_LOG_IMU)) {
         Log_Write_Baro();
     }
-    return barometer.get_altitude() * 100.0f;
+    baro_alt = barometer.get_altitude() * 100.0f;
+    baro_climbrate = barometer.get_climb_rate() * 100.0f;
 }
+
+#if CONFIG_SONAR == ENABLED
+static void init_sonar(void)
+{
+   sonar.init();
+}
+#endif
 
 // return sonar altitude in centimeters
 static int16_t read_sonar(void)
 {
 #if CONFIG_SONAR == ENABLED
+    sonar.update();
+
     // exit immediately if sonar is disabled
-    if( !g.sonar_enabled ) {
+    if (!sonar_enabled || !sonar.healthy()) {
         sonar_alt_health = 0;
         return 0;
     }
 
-    int16_t temp_alt = sonar->read();
+    int16_t temp_alt = sonar.distance_cm();
 
-    if (temp_alt >= sonar->min_distance && temp_alt <= sonar->max_distance * SONAR_RELIABLE_DISTANCE_PCT) {
+    if (temp_alt >= sonar.min_distance_cm() && 
+        temp_alt <= sonar.max_distance_cm() * SONAR_RELIABLE_DISTANCE_PCT) {
         if ( sonar_alt_health < SONAR_ALT_HEALTH_MAX ) {
             sonar_alt_health++;
         }
@@ -65,6 +65,7 @@ static int16_t read_sonar(void)
 #endif
 }
 
+// initialise compass
 static void init_compass()
 {
     if (!compass.init() || !compass.read()) {
@@ -76,17 +77,53 @@ static void init_compass()
     ahrs.set_compass(&compass);
 }
 
+// initialise optical flow sensor
 static void init_optflow()
 {
 #if OPTFLOW == ENABLED
+    // exit immediately if not enabled
+    if (!optflow.enabled()) {
+        return;
+    }
+
+    // initialise sensor and display error on failure
     optflow.init();
     if (!optflow.healthy()) {
-        g.optflow_enabled = false;
         cliSerial->print_P(PSTR("Failed to Init OptFlow\n"));
         Log_Write_Error(ERROR_SUBSYSTEM_OPTFLOW,ERROR_CODE_FAILED_TO_INITIALISE);
     }
 #endif      // OPTFLOW == ENABLED
 }
+
+// called at 200hz
+#if OPTFLOW == ENABLED
+static void update_optical_flow(void)
+{
+    static uint32_t last_of_update = 0;
+
+    // exit immediately if not enabled
+    if (!optflow.enabled()) {
+        return;
+    }
+
+    // read from sensor
+    optflow.update();
+
+    // write to log and send to EKF if new data has arrived
+    if (optflow.last_update() != last_of_update) {
+        last_of_update = optflow.last_update();
+        uint8_t flowQuality = optflow.quality();
+        Vector2f flowRate = optflow.flowRate();
+        Vector2f bodyRate = optflow.bodyRate();
+        // Use range from a separate range finder if available, not the PX4Flows built in sensor which is ineffective
+        float ground_distance_m = 0.01f*float(sonar_alt);
+        ahrs.writeOptFlowMeas(flowQuality, flowRate, bodyRate, last_of_update, sonar_alt_health, ground_distance_m);
+        if (g.log_bitmask & MASK_LOG_OPTFLOW) {
+            Log_Write_Optflow();
+        }
+    }
+}
+#endif  // OPTFLOW == ENABLED
 
 // read_battery - check battery voltage and current and invoke failsafe if necessary
 // called at 10hz
@@ -95,14 +132,27 @@ static void read_battery(void)
     battery.read();
 
     // update compass with current value
-    if (battery.monitoring() == AP_BATT_MONITOR_VOLTAGE_AND_CURRENT) {
+    if (battery.has_current()) {
         compass.set_current(battery.current_amps());
+    }
+
+    // update motors with voltage and current
+    if (battery.get_type() != AP_BattMonitor::BattMonitor_TYPE_NONE) {
+        motors.set_voltage(battery.voltage());
+    }
+    if (battery.has_current()) {
+        motors.set_current(battery.current_amps());
     }
 
     // check for low voltage or current if the low voltage check hasn't already been triggered
     // we only check when we're not powered by USB to avoid false alarms during bench tests
     if (!ap.usb_connected && !failsafe.battery && battery.exhausted(g.fs_batt_voltage, g.fs_batt_mah)) {
         failsafe_battery_event();
+    }
+
+    // log battery info to the dataflash
+    if (should_log(MASK_LOG_CURRENT)) {
+        Log_Write_Current();
     }
 }
 
@@ -119,3 +169,11 @@ void read_receiver_rssi(void)
         receiver_rssi = constrain_int16(ret, 0, 255);
     }
 }
+
+#if EPM_ENABLED == ENABLED
+// epm update - moves epm pwm output back to neutral after grab or release is completed
+void epm_update()
+{
+    epm.update();
+}
+#endif

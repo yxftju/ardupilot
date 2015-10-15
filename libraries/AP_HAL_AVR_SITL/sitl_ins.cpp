@@ -23,7 +23,9 @@
 #include <AP_Math.h>
 #include "../AP_ADC/AP_ADC.h"
 #include <SITL_State.h>
+#include <fenv.h>
 
+extern const AP_HAL::HAL& hal;
 
 using namespace AVR_SITL;
 
@@ -38,6 +40,40 @@ uint16_t SITL_State::_airspeed_sensor(float airspeed)
 
 	airspeed_pressure = (airspeed*airspeed) / airspeed_ratio;
 	airspeed_raw = airspeed_pressure + airspeed_offset;
+        if (airspeed_raw/4 > 0xFFFF) {
+            return 0xFFFF;
+        }
+    // add delay
+    uint32_t now = hal.scheduler->millis();
+    uint32_t best_time_delta_wind = 200; // initialise large time representing buffer entry closest to current time - delay.
+    uint8_t best_index_wind = 0; // initialise number representing the index of the entry in buffer closest to delay.
+
+    // storing data from sensor to buffer
+    if (now - last_store_time_wind >= 10) { // store data every 10 ms.
+        last_store_time_wind = now;
+        if (store_index_wind > wind_buffer_length-1) { // reset buffer index if index greater than size of buffer
+            store_index_wind = 0;
+        }
+        buffer_wind[store_index_wind].data = airspeed_raw; // add data to current index
+        buffer_wind[store_index_wind].time = last_store_time_wind; // add time to current index
+        store_index_wind = store_index_wind + 1; // increment index
+    }
+
+    // return delayed measurement
+    delayed_time_wind = now - _sitl->wind_delay; // get time corresponding to delay
+    // find data corresponding to delayed time in buffer
+    for (uint8_t i=0; i<=wind_buffer_length-1; i++) {
+        time_delta_wind = abs(delayed_time_wind - buffer_wind[i].time); // find difference between delayed time and time stamp in buffer
+        // if this difference is smaller than last delta, store this time
+        if (time_delta_wind < best_time_delta_wind) {
+            best_index_wind = i;
+            best_time_delta_wind = time_delta_wind;
+        }
+    }
+    if (best_time_delta_wind < 200) { // only output stored state if < 200 msec retrieval error
+        airspeed_raw = buffer_wind[best_index_wind].data;
+    }
+
 	return airspeed_raw/4;
 }
 
@@ -48,7 +84,7 @@ float SITL_State::_gyro_drift(void)
 		return 0;
 	}
 	double period  = _sitl->drift_time * 2;
-	double minutes = fmod(_scheduler->_micros() / 60.0e6, period);
+	double minutes = fmod(_scheduler->_micros64() / 60.0e6, period);
 	if (minutes < period/2) {
 		return minutes * ToRad(_sitl->drift_speed);
 	}
@@ -56,29 +92,31 @@ float SITL_State::_gyro_drift(void)
 
 }
 
-uint16_t SITL_State::_ground_sonar(float altitude)
+/*
+  emulate an analog rangefinder
+ */
+uint16_t SITL_State::_ground_sonar(void)
 {
-	static float home_alt = -1;
-	// TODO Find the current sonar object and load these params from it
-	// rather than assuming XL type
-	float scaler = AP_RANGEFINDER_MAXSONARXL_SCALER;
+    float altitude = height_agl();
 
-	if (home_alt == -1)
-		home_alt = altitude;
+    float voltage = 5.0f;
+    if (fabsf(_sitl->state.rollDeg) < 90 &&
+        fabsf(_sitl->state.pitchDeg) < 90) {
+        // adjust for apparent altitude with roll
+        altitude /= cos(radians(_sitl->state.rollDeg)) * cos(radians(_sitl->state.pitchDeg));
+        
+        altitude += _sitl->sonar_noise * _rand_float();
 
-	altitude = altitude - home_alt;
-
-	altitude += _sitl->sonar_noise * _rand_float();
-
-	if (_sitl->sonar_glitch >= (_rand_float() + 1.0f)/2.0f)
-		altitude = AP_RANGEFINDER_MAXSONARXL_MAX_DISTANCE / 100.0f;
-
-	altitude = constrain_float(altitude,
-		AP_RANGEFINDER_MAXSONARXL_MIN_DISTANCE / 100.0f,
-		AP_RANGEFINDER_MAXSONARXL_MAX_DISTANCE / 100.0f);
-
-	// Altitude in in m, scaler relative to cm
-	return (uint16_t)(altitude * 100.0f / scaler);
+        // Altitude in in m, scaler in meters/volt
+        voltage = altitude / _sitl->sonar_scale;
+        voltage = constrain_float(voltage, 0, 5.0f);
+        
+        if (_sitl->sonar_glitch >= (_rand_float() + 1.0f)/2.0f) {
+            voltage = 5.0f;
+        }
+    }
+    
+    return 1023*(voltage / 5.0f);
 }
 
 /*
@@ -134,28 +172,42 @@ void SITL_State::_update_ins(float roll, 	float pitch, 	float yaw,		// Relative 
 		accel_noise += _sitl->accel_noise;
 		gyro_noise += ToRad(_sitl->gyro_noise);
 	}
-	xAccel += accel_noise * _rand_float();
-	yAccel += accel_noise * _rand_float();
-	zAccel += accel_noise * _rand_float();
+	// get accel bias (add only to first accelerometer)
+	Vector3f accel_bias = _sitl->accel_bias.get();
+	float xAccel1 = xAccel + accel_noise * _rand_float() + accel_bias.x;
+	float yAccel1 = yAccel + accel_noise * _rand_float() + accel_bias.y;
+	float zAccel1 = zAccel + accel_noise * _rand_float() + accel_bias.z;
+
+	float xAccel2 = xAccel + accel_noise * _rand_float();
+	float yAccel2 = yAccel + accel_noise * _rand_float();
+	float zAccel2 = zAccel + accel_noise * _rand_float();
 
         if (fabs(_sitl->accel_fail) > 1.0e-6) {
-            xAccel = _sitl->accel_fail;
-            yAccel = _sitl->accel_fail;
-            zAccel = _sitl->accel_fail;
+            xAccel1 = _sitl->accel_fail;
+            yAccel1 = _sitl->accel_fail;
+            zAccel1 = _sitl->accel_fail;
         }
 
-	p += gyro_noise * _rand_float();
-	q += gyro_noise * _rand_float();
-	r += gyro_noise * _rand_float();
+	_ins->set_accel(0, Vector3f(xAccel1, yAccel1, zAccel1) + _ins->get_accel_offsets(0));
+	_ins->set_accel(1, Vector3f(xAccel2, yAccel2, zAccel2) + _ins->get_accel_offsets(1));
 
 	p += _gyro_drift();
 	q += _gyro_drift();
 	r += _gyro_drift();
 
-	_ins->set_gyro(Vector3f(p, q, r) + _ins->get_gyro_offsets());
-	_ins->set_accel(Vector3f(xAccel, yAccel, zAccel) + _ins->get_accel_offsets());
+	float p1 = p + gyro_noise * _rand_float();
+	float q1 = q + gyro_noise * _rand_float();
+	float r1 = r + gyro_noise * _rand_float();
 
-        sonar_pin_value    = _ground_sonar(altitude);
+	float p2 = p + gyro_noise * _rand_float();
+	float q2 = q + gyro_noise * _rand_float();
+	float r2 = r + gyro_noise * _rand_float();
+
+	_ins->set_gyro(0, Vector3f(p1, q1, r1) + _ins->get_gyro_offsets(0));
+	_ins->set_gyro(1, Vector3f(p2, q2, r2) + _ins->get_gyro_offsets(1));
+
+
+        sonar_pin_value    = _ground_sonar();
         airspeed_pin_value = _airspeed_sensor(airspeed + (_sitl->aspd_noise * _rand_float()));
 }
 

@@ -5,6 +5,7 @@
 // Code to Write and Read packets from DataFlash log memory
 // Code to interact with the user to dump or erase logs
 
+#if CLI_ENABLED == ENABLED
 // These are function definitions so the Menu can be constructed before the functions
 // are defined below. Order matters to the compiler.
 static bool     print_log_menu(void);
@@ -57,6 +58,7 @@ print_log_menu(void)
     return(true);
 }
 
+#if CLI_ENABLED == ENABLED
 static int8_t
 dump_log(uint8_t argc, const Menu::arg *argv)
 {
@@ -85,13 +87,7 @@ dump_log(uint8_t argc, const Menu::arg *argv)
     Log_Read((uint16_t)dump_log, dump_log_start, dump_log_end);
     return (0);
 }
-
-static void do_erase_logs(void)
-{
-	gcs_send_text_P(SEVERITY_LOW, PSTR("Erasing logs\n"));
-    DataFlash.EraseAll();
-	gcs_send_text_P(SEVERITY_LOW, PSTR("Log erase complete\n"));
-}
+#endif
 
 static int8_t
 erase_logs(uint8_t argc, const Menu::arg *argv)
@@ -156,46 +152,60 @@ process_logs(uint8_t argc, const Menu::arg *argv)
     log_menu.run();
     return 0;
 }
+#endif // CLI_ENABLED
+
+static void do_erase_logs(void)
+{
+    gcs_send_text_P(SEVERITY_HIGH, PSTR("Erasing logs\n"));
+    DataFlash.EraseAll();
+    gcs_send_text_P(SEVERITY_HIGH, PSTR("Log erase complete\n"));
+}
 
 #if AUTOTUNE_ENABLED == ENABLED
 struct PACKED log_AutoTune {
     LOG_PACKET_HEADER;
+    uint32_t time_ms;
     uint8_t axis;           // roll or pitch
     uint8_t tune_step;      // tuning PI or D up or down
+    float   rate_target;    // target achieved rotation rate
     float   rate_min;       // maximum achieved rotation rate
     float   rate_max;       // maximum achieved rotation rate
-    float   new_gain_rp;       // newly calculated gain
-    float   new_gain_rd;       // newly calculated gain
-    float   new_gain_sp;       // newly calculated gain
+    float   new_gain_rp;    // newly calculated gain
+    float   new_gain_rd;    // newly calculated gain
+    float   new_gain_sp;    // newly calculated gain
 };
 
-// Write an Current data packet
-static void Log_Write_AutoTune(uint8_t axis, uint8_t tune_step, float rate_min, float rate_max, float new_gain_rp, float new_gain_rd, float new_gain_sp)
+// Write an Autotune data packet
+static void Log_Write_AutoTune(uint8_t axis, uint8_t tune_step, float rate_target, float rate_min, float rate_max, float new_gain_rp, float new_gain_rd, float new_gain_sp)
 {
     struct log_AutoTune pkt = {
         LOG_PACKET_HEADER_INIT(LOG_AUTOTUNE_MSG),
+        time_ms     : hal.scheduler->millis(),
         axis        : axis,
         tune_step   : tune_step,
+        rate_target : rate_target,
         rate_min    : rate_min,
         rate_max    : rate_max,
-        new_gain_rp  : new_gain_rp,
-        new_gain_rd  : new_gain_rd,
-        new_gain_sp  : new_gain_sp
+        new_gain_rp : new_gain_rp,
+        new_gain_rd : new_gain_rd,
+        new_gain_sp : new_gain_sp
     };
     DataFlash.WriteBlock(&pkt, sizeof(pkt));
 }
 
 struct PACKED log_AutoTuneDetails {
     LOG_PACKET_HEADER;
-    int16_t angle_cd;       // lean angle in centi-degrees
-    float   rate_cds;       // current rotation rate in centi-degrees / second
+    uint32_t time_ms;
+    float    angle_cd;      // lean angle in centi-degrees
+    float    rate_cds;      // current rotation rate in centi-degrees / second
 };
 
-// Write an Current data packet
-static void Log_Write_AutoTuneDetails(int16_t angle_cd, float rate_cds)
+// Write an Autotune data packet
+static void Log_Write_AutoTuneDetails(float angle_cd, float rate_cds)
 {
     struct log_AutoTuneDetails pkt = {
         LOG_PACKET_HEADER_INIT(LOG_AUTOTUNEDETAILS_MSG),
+        time_ms     : hal.scheduler->millis(),
         angle_cd    : angle_cd,
         rate_cds    : rate_cds
     };
@@ -203,31 +213,10 @@ static void Log_Write_AutoTuneDetails(int16_t angle_cd, float rate_cds)
 }
 #endif
 
-struct PACKED log_Current {
-    LOG_PACKET_HEADER;
-    uint32_t time_ms;
-    int16_t  throttle_out;
-    uint32_t throttle_integrator;
-    int16_t  battery_voltage;
-    int16_t  current_amps;
-    uint16_t board_voltage;
-    float    current_total;
-};
-
-// Write an Current data packet
+// Write a Current data packet
 static void Log_Write_Current()
 {
-    struct log_Current pkt = {
-        LOG_PACKET_HEADER_INIT(LOG_CURRENT_MSG),
-        time_ms             : hal.scheduler->millis(),
-        throttle_out        : g.rc_3.servo_out,
-        throttle_integrator : throttle_integrator,
-        battery_voltage     : (int16_t) (battery.voltage() * 100.0f),
-        current_amps        : (int16_t) (battery.current_amps() * 100.0f),
-        board_voltage       : (uint16_t)(hal.analogin->board_voltage()*1000),
-        current_total       : battery.current_total_mah()
-    };
-    DataFlash.WriteBlock(&pkt, sizeof(pkt));
+    DataFlash.Log_Write_Current(battery, g.rc_3.servo_out);
 
     // also write power status
     DataFlash.Log_Write_Power();
@@ -235,28 +224,32 @@ static void Log_Write_Current()
 
 struct PACKED log_Optflow {
     LOG_PACKET_HEADER;
-    int16_t dx;
-    int16_t dy;
+    uint32_t time_ms;
     uint8_t surface_quality;
-    int16_t x_cm;
-    int16_t y_cm;
-    int32_t roll;
-    int32_t pitch;
+    float flow_x;
+    float flow_y;
+    float body_x;
+    float body_y;
 };
 
 // Write an optical flow packet
 static void Log_Write_Optflow()
 {
  #if OPTFLOW == ENABLED
+    // exit immediately if not enabled
+    if (!optflow.enabled()) {
+        return;
+    }
+    const Vector2f &flowRate = optflow.flowRate();
+    const Vector2f &bodyRate = optflow.bodyRate();
     struct log_Optflow pkt = {
         LOG_PACKET_HEADER_INIT(LOG_OPTFLOW_MSG),
-        dx              : optflow.dx,
-        dy              : optflow.dy,
-        surface_quality : optflow.surface_quality,
-        x_cm            : (int16_t) optflow.x_cm,
-        y_cm            : (int16_t) optflow.y_cm,
-        roll            : of_roll,
-        pitch           : of_pitch
+        time_ms         : hal.scheduler->millis(),
+        surface_quality : optflow.quality(),
+        flow_x          : flowRate.x,
+        flow_y          : flowRate.y,
+        body_x          : bodyRate.x,
+        body_y          : bodyRate.y
     };
     DataFlash.WriteBlock(&pkt, sizeof(pkt));
  #endif     // OPTFLOW == ENABLED
@@ -328,71 +321,14 @@ static void Log_Write_Control_Tuning()
         angle_boost         : attitude_control.angle_boost(),
         throttle_out        : g.rc_3.servo_out,
         desired_alt         : pos_control.get_alt_target() / 100.0f,
-        inav_alt            : current_loc.alt / 100.0f,
+        inav_alt            : inertial_nav.get_altitude() / 100.0f,
         baro_alt            : baro_alt,
         desired_sonar_alt   : (int16_t)target_sonar_alt,
         sonar_alt           : sonar_alt,
-        desired_climb_rate  : desired_climb_rate,
+        desired_climb_rate  : (int16_t)pos_control.get_vel_target_z(),
         climb_rate          : climb_rate
     };
     DataFlash.WriteBlock(&pkt, sizeof(pkt));
-}
-
-struct PACKED log_Compass {
-    LOG_PACKET_HEADER;
-    uint32_t time_ms;
-    int16_t  mag_x;
-    int16_t  mag_y;
-    int16_t  mag_z;
-    int16_t  offset_x;
-    int16_t  offset_y;
-    int16_t  offset_z;
-    int16_t  motor_offset_x;
-    int16_t  motor_offset_y;
-    int16_t  motor_offset_z;
-};
-
-// Write a Compass packet
-static void Log_Write_Compass()
-{
-    const Vector3f &mag_offsets = compass.get_offsets(0);
-    const Vector3f &mag_motor_offsets = compass.get_motor_offsets(0);
-    const Vector3f &mag = compass.get_field(0);
-    struct log_Compass pkt = {
-        LOG_PACKET_HEADER_INIT(LOG_COMPASS_MSG),
-        time_ms         : hal.scheduler->millis(),
-        mag_x           : (int16_t)mag.x,
-        mag_y           : (int16_t)mag.y,
-        mag_z           : (int16_t)mag.z,
-        offset_x        : (int16_t)mag_offsets.x,
-        offset_y        : (int16_t)mag_offsets.y,
-        offset_z        : (int16_t)mag_offsets.z,
-        motor_offset_x  : (int16_t)mag_motor_offsets.x,
-        motor_offset_y  : (int16_t)mag_motor_offsets.y,
-        motor_offset_z  : (int16_t)mag_motor_offsets.z
-    };
-    DataFlash.WriteBlock(&pkt, sizeof(pkt));
-#if COMPASS_MAX_INSTANCES > 1
-    if (compass.get_count() > 1) {
-        const Vector3f &mag2_offsets = compass.get_offsets(1);
-        const Vector3f &mag2_motor_offsets = compass.get_motor_offsets(1);
-        const Vector3f &mag2 = compass.get_field(1);
-        struct log_Compass pkt2 = {
-            LOG_PACKET_HEADER_INIT(LOG_COMPASS2_MSG),
-            time_ms         : hal.scheduler->millis(),
-            mag_x           : (int16_t)mag2.x,
-            mag_y           : (int16_t)mag2.y,
-            mag_z           : (int16_t)mag2.z,
-            offset_x        : (int16_t)mag2_offsets.x,
-            offset_y        : (int16_t)mag2_offsets.y,
-            offset_z        : (int16_t)mag2_offsets.z,
-            motor_offset_x  : (int16_t)mag2_motor_offsets.x,
-            motor_offset_y  : (int16_t)mag2_motor_offsets.y,
-            motor_offset_z  : (int16_t)mag2_motor_offsets.z
-        };
-        DataFlash.WriteBlock(&pkt2, sizeof(pkt2));
-    }
-#endif
 }
 
 struct PACKED log_Performance {
@@ -403,7 +339,6 @@ struct PACKED log_Performance {
     int16_t  pm_test;
     uint8_t i2c_lockup_count;
     uint16_t ins_error_count;
-    uint8_t inav_error_count;
 };
 
 // Write a performance monitoring packet
@@ -416,71 +351,31 @@ static void Log_Write_Performance()
         max_time         : perf_info_get_max_time(),
         pm_test          : pmTest1,
         i2c_lockup_count : hal.i2c->lockup_count(),
-        ins_error_count  : ins.error_count(),
-        inav_error_count : inertial_nav.error_count()
+        ins_error_count  : ins.error_count()
     };
     DataFlash.WriteBlock(&pkt, sizeof(pkt));
 }
 
-struct PACKED log_Cmd {
-    LOG_PACKET_HEADER;
-    uint8_t command_total;
-    uint8_t command_number;
-    uint8_t waypoint_id;
-    uint8_t waypoint_options;
-    uint8_t waypoint_param1;
-    int32_t waypoint_altitude;
-    int32_t waypoint_latitude;
-    int32_t waypoint_longitude;
-};
-
-// Write a command processing packet
-static void Log_Write_Cmd(uint8_t num, const struct Location *wp)
+// Write a mission command. Total length : 36 bytes
+static void Log_Write_Cmd(const AP_Mission::Mission_Command &cmd)
 {
-    struct log_Cmd pkt = {
-        LOG_PACKET_HEADER_INIT(LOG_CMD_MSG),
-        command_total       : g.command_total,
-        command_number      : num,
-        waypoint_id         : wp->id,
-        waypoint_options    : wp->options,
-        waypoint_param1     : wp->p1,
-        waypoint_altitude   : wp->alt,
-        waypoint_latitude   : wp->lat,
-        waypoint_longitude  : wp->lng
-    };
-    DataFlash.WriteBlock(&pkt, sizeof(pkt));
+    mavlink_mission_item_t mav_cmd = {};
+    AP_Mission::mission_cmd_to_mavlink(cmd,mav_cmd);
+    DataFlash.Log_Write_MavCmd(mission.num_commands(),mav_cmd);
 }
-
-struct PACKED log_Attitude {
-    LOG_PACKET_HEADER;
-    uint32_t time_ms;
-    int16_t  control_roll;
-    int16_t  roll;
-    int16_t  control_pitch;
-    int16_t  pitch;
-    uint16_t control_yaw;
-    uint16_t yaw;
-};
 
 // Write an attitude packet
 static void Log_Write_Attitude()
 {
-    Vector3f targets;
-    get_angle_targets_for_reporting(targets);
-    struct log_Attitude pkt = {
-        LOG_PACKET_HEADER_INIT(LOG_ATTITUDE_MSG),
-        time_ms         : hal.scheduler->millis(),
-        control_roll    : (int16_t)targets.x,
-        roll            : (int16_t)ahrs.roll_sensor,
-        control_pitch   : (int16_t)targets.y,
-        pitch           : (int16_t)ahrs.pitch_sensor,
-        control_yaw     : (uint16_t)targets.z,
-        yaw             : (uint16_t)ahrs.yaw_sensor
-    };
-    DataFlash.WriteBlock(&pkt, sizeof(pkt));
+    Vector3f targets = attitude_control.angle_ef_targets();
+    DataFlash.Log_Write_Attitude(ahrs, targets);
 
 #if AP_AHRS_NAVEKF_AVAILABLE
-    DataFlash.Log_Write_EKF(ahrs);
+ #if OPTFLOW == ENABLED
+    DataFlash.Log_Write_EKF(ahrs,optflow.enabled());
+ #else
+    DataFlash.Log_Write_EKF(ahrs,false);
+ #endif
     DataFlash.Log_Write_AHRS2(ahrs);
 #endif
 #if CONFIG_HAL_BOARD == HAL_BOARD_AVR_SITL
@@ -488,21 +383,68 @@ static void Log_Write_Attitude()
 #endif
 }
 
-struct PACKED log_Mode {
+struct PACKED log_Rate {
     LOG_PACKET_HEADER;
-    uint8_t mode;
-    int16_t throttle_cruise;
+    uint32_t time_ms;
+    float   control_roll;
+    float   roll;
+    float   roll_out;
+    float   control_pitch;
+    float   pitch;
+    float   pitch_out;
+    float   control_yaw;
+    float   yaw;
+    float   yaw_out;
+    float   control_accel;
+    float   accel;
+    float   accel_out;
 };
 
-// Write a mode packet
-static void Log_Write_Mode(uint8_t mode)
+// Write an rate packet
+static void Log_Write_Rate()
 {
-    struct log_Mode pkt = {
-        LOG_PACKET_HEADER_INIT(LOG_MODE_MSG),
-        mode            : mode,
-        throttle_cruise : g.throttle_cruise,
+    const Vector3f &rate_targets = attitude_control.rate_bf_targets();
+    const Vector3f &accel_target = pos_control.get_accel_target();
+    struct log_Rate pkt_rate = {
+        LOG_PACKET_HEADER_INIT(LOG_RATE_MSG),
+        time_ms         : hal.scheduler->millis(),
+        control_roll    : (float)rate_targets.x,
+        roll            : (float)(ahrs.get_gyro().x * AC_ATTITUDE_CONTROL_DEGX100),
+        roll_out        : (float)(motors.get_roll()),
+        control_pitch   : (float)rate_targets.y,
+        pitch           : (float)(ahrs.get_gyro().y * AC_ATTITUDE_CONTROL_DEGX100),
+        pitch_out       : (float)(motors.get_pitch()),
+        control_yaw     : (float)rate_targets.z,
+        yaw             : (float)(ahrs.get_gyro().z * AC_ATTITUDE_CONTROL_DEGX100),
+        yaw_out         : (float)(motors.get_yaw()),
+        control_accel   : (float)accel_target.z,
+        accel           : (float)(-(ahrs.get_accel_ef_blended().z + GRAVITY_MSS) * 100.0f),
+        accel_out       : (float)(motors.get_throttle_out())
     };
-    DataFlash.WriteBlock(&pkt, sizeof(pkt));
+    DataFlash.WriteBlock(&pkt_rate, sizeof(pkt_rate));
+}
+
+struct PACKED log_MotBatt {
+    LOG_PACKET_HEADER;
+    uint32_t time_ms;
+    float   lift_max;
+    float   bat_volt;
+    float   bat_res;
+    float   th_limit;
+};
+
+// Write an rate packet
+static void Log_Write_MotBatt()
+{
+    struct log_MotBatt pkt_mot = {
+        LOG_PACKET_HEADER_INIT(LOG_MOTBATT_MSG),
+        time_ms         : hal.scheduler->millis(),
+        lift_max        : (float)(motors.get_lift_max()),
+        bat_volt        : (float)(motors.get_batt_voltage_filt()),
+        bat_res         : (float)(motors.get_batt_resistance()),
+        th_limit        : (float)(motors.get_throttle_limit())
+    };
+    DataFlash.WriteBlock(&pkt_mot, sizeof(pkt_mot));
 }
 
 struct PACKED log_Startup {
@@ -526,7 +468,7 @@ struct PACKED log_Event {
 // Wrote an event packet
 static void Log_Write_Event(uint8_t id)
 {
-    if (g.log_bitmask != 0) {
+    if (should_log(MASK_LOG_ANY)) {
         struct log_Event pkt = {
             LOG_PACKET_HEADER_INIT(LOG_EVENT_MSG),
             id  : id
@@ -542,9 +484,10 @@ struct PACKED log_Data_Int16t {
 };
 
 // Write an int16_t data packet
+UNUSED_FUNCTION
 static void Log_Write_Data(uint8_t id, int16_t value)
 {
-    if (g.log_bitmask != 0) {
+    if (should_log(MASK_LOG_ANY)) {
         struct log_Data_Int16t pkt = {
             LOG_PACKET_HEADER_INIT(LOG_DATA_INT16_MSG),
             id          : id,
@@ -561,9 +504,10 @@ struct PACKED log_Data_UInt16t {
 };
 
 // Write an uint16_t data packet
+UNUSED_FUNCTION 
 static void Log_Write_Data(uint8_t id, uint16_t value)
 {
-    if (g.log_bitmask != 0) {
+    if (should_log(MASK_LOG_ANY)) {
         struct log_Data_UInt16t pkt = {
             LOG_PACKET_HEADER_INIT(LOG_DATA_UINT16_MSG),
             id          : id,
@@ -582,7 +526,7 @@ struct PACKED log_Data_Int32t {
 // Write an int32_t data packet
 static void Log_Write_Data(uint8_t id, int32_t value)
 {
-    if (g.log_bitmask != 0) {
+    if (should_log(MASK_LOG_ANY)) {
         struct log_Data_Int32t pkt = {
             LOG_PACKET_HEADER_INIT(LOG_DATA_INT32_MSG),
             id          : id,
@@ -601,7 +545,7 @@ struct PACKED log_Data_UInt32t {
 // Write a uint32_t data packet
 static void Log_Write_Data(uint8_t id, uint32_t value)
 {
-    if (g.log_bitmask != 0) {
+    if (should_log(MASK_LOG_ANY)) {
         struct log_Data_UInt32t pkt = {
             LOG_PACKET_HEADER_INIT(LOG_DATA_UINT32_MSG),
             id          : id,
@@ -618,9 +562,10 @@ struct PACKED log_Data_Float {
 };
 
 // Write a float data packet
+UNUSED_FUNCTION
 static void Log_Write_Data(uint8_t id, float value)
 {
-    if (g.log_bitmask != 0) {
+    if (should_log(MASK_LOG_ANY)) {
         struct log_Data_Float pkt = {
             LOG_PACKET_HEADER_INIT(LOG_DATA_FLOAT_MSG),
             id          : id,
@@ -628,37 +573,6 @@ static void Log_Write_Data(uint8_t id, float value)
         };
         DataFlash.WriteBlock(&pkt, sizeof(pkt));
     }
-}
-
-struct PACKED log_Camera {
-    LOG_PACKET_HEADER;
-    uint32_t gps_time;
-    uint16_t gps_week;
-    int32_t  latitude;
-    int32_t  longitude;
-    int32_t  altitude;
-    int16_t  roll;
-    int16_t  pitch;
-    uint16_t yaw;
-};
-
-// Write a Camera packet
-static void Log_Write_Camera()
-{
-#if CAMERA == ENABLED
-    struct log_Camera pkt = {
-        LOG_PACKET_HEADER_INIT(LOG_CAMERA_MSG),
-        gps_time    : g_gps->time_week_ms,
-        gps_week    : g_gps->time_week,
-        latitude    : current_loc.lat,
-        longitude   : current_loc.lng,
-        altitude    : current_loc.alt,
-        roll        : (int16_t)ahrs.roll_sensor,
-        pitch       : (int16_t)ahrs.pitch_sensor,
-        yaw         : (uint16_t)ahrs.yaw_sensor
-    };
-    DataFlash.WriteBlock(&pkt, sizeof(pkt));
-#endif
 }
 
 struct PACKED log_Error {
@@ -685,32 +599,24 @@ static void Log_Write_Baro(void)
 
 static const struct LogStructure log_structure[] PROGMEM = {
     LOG_COMMON_STRUCTURES,
-#if AUTOTUNE == ENABLED
+#if AUTOTUNE_ENABLED == ENABLED
     { LOG_AUTOTUNE_MSG, sizeof(log_AutoTune),
-      "ATUN", "BBfffff",       "Axis,TuneStep,RateMin,RateMax,RPGain,RDGain,SPGain" },
+      "ATUN", "IBBffffff",       "TimeMS,Axis,TuneStep,RateTarg,RateMin,RateMax,RP,RD,SP" },
     { LOG_AUTOTUNEDETAILS_MSG, sizeof(log_AutoTuneDetails),
-      "ATDE", "cf",          "Angle,Rate" },
+      "ATDE", "Iff",          "TimeMS,Angle,Rate" },
 #endif
-    { LOG_CURRENT_MSG, sizeof(log_Current),             
-      "CURR", "IhIhhhf",     "TimeMS,ThrOut,ThrInt,Volt,Curr,Vcc,CurrTot" },
     { LOG_OPTFLOW_MSG, sizeof(log_Optflow),       
-      "OF",   "hhBccee",   "Dx,Dy,SQual,X,Y,Roll,Pitch" },
+      "OF",   "IBffff",   "TimeMS,Qual,flowX,flowY,bodyX,bodyY" },
     { LOG_NAV_TUNING_MSG, sizeof(log_Nav_Tuning),       
       "NTUN", "Iffffffffff", "TimeMS,DPosX,DPosY,PosX,PosY,DVelX,DVelY,VelX,VelY,DAccX,DAccY" },
     { LOG_CONTROL_TUNING_MSG, sizeof(log_Control_Tuning),
       "CTUN", "Ihhhffecchh", "TimeMS,ThrIn,AngBst,ThrOut,DAlt,Alt,BarAlt,DSAlt,SAlt,DCRt,CRt" },
-    { LOG_COMPASS_MSG, sizeof(log_Compass),             
-      "MAG", "Ihhhhhhhhh",    "TimeMS,MagX,MagY,MagZ,OfsX,OfsY,OfsZ,MOfsX,MOfsY,MOfsZ" },
-    { LOG_COMPASS2_MSG, sizeof(log_Compass),             
-      "MAG2","Ihhhhhhhhh",    "TimeMS,MagX,MagY,MagZ,OfsX,OfsY,OfsZ,MOfsX,MOfsY,MOfsZ" },
     { LOG_PERFORMANCE_MSG, sizeof(log_Performance), 
-      "PM",  "HHIhBHB",    "NLon,NLoop,MaxT,PMT,I2CErr,INSErr,INAVErr" },
-    { LOG_CMD_MSG, sizeof(log_Cmd),                 
-      "CMD", "BBBBBeLL",     "CTot,CNum,CId,COpt,Prm1,Alt,Lat,Lng" },
-    { LOG_ATTITUDE_MSG, sizeof(log_Attitude),       
-      "ATT", "IccccCC",      "TimeMS,DesRoll,Roll,DesPitch,Pitch,DesYaw,Yaw" },
-    { LOG_MODE_MSG, sizeof(log_Mode),
-      "MODE", "Mh",          "Mode,ThrCrs" },
+      "PM",  "HHIhBH",    "NLon,NLoop,MaxT,PMT,I2CErr,INSErr" },
+    { LOG_RATE_MSG, sizeof(log_Rate),
+      "RATE", "Iffffffffffff",  "TimeMS,RDes,R,ROut,PDes,P,POut,YDes,Y,YOut,ADes,A,AOut" },
+    { LOG_MOTBATT_MSG, sizeof(log_MotBatt),
+      "MOTB", "Iffff",  "TimeMS,LiftMax,BatVolt,BatRes,ThLimit" },
     { LOG_STARTUP_MSG, sizeof(log_Startup),         
       "STRT", "",            "" },
     { LOG_EVENT_MSG, sizeof(log_Event),         
@@ -725,29 +631,26 @@ static const struct LogStructure log_structure[] PROGMEM = {
       "DU32",  "BI",         "Id,Value" },
     { LOG_DATA_FLOAT_MSG, sizeof(log_Data_Float),         
       "DFLT",  "Bf",         "Id,Value" },
-    { LOG_CAMERA_MSG, sizeof(log_Camera),                 
-      "CAM",   "IHLLeccC",   "GPSTime,GPSWeek,Lat,Lng,Alt,Roll,Pitch,Yaw" },
     { LOG_ERROR_MSG, sizeof(log_Error),         
       "ERR",   "BB",         "Subsys,ECode" },
 };
 
+#if CLI_ENABLED == ENABLED
 // Read the DataFlash log memory
 static void Log_Read(uint16_t log_num, uint16_t start_page, uint16_t end_page)
 {
- #ifdef AIRFRAME_NAME
-    cliSerial->printf_P(PSTR((AIRFRAME_NAME)));
- #endif
-
     cliSerial->printf_P(PSTR("\n" FIRMWARE_STRING
-                             "\nFree RAM: %u\n"),
+                             "\nFree RAM: %u\n"
+                             "\nFrame: " FRAME_CONFIG_STRING "\n"),
                         (unsigned) hal.util->available_memory());
 
     cliSerial->println_P(PSTR(HAL_BOARD_NAME));
 
-	DataFlash.LogReadProcess(log_num, start_page, end_page, 
+    DataFlash.LogReadProcess(log_num, start_page, end_page, 
                              print_flight_mode,
                              cliSerial);
 }
+#endif // CLI_ENABLED
 
 // start a new log
 static void start_logging() 
@@ -769,9 +672,10 @@ static void start_logging()
             if (hal.util->get_system_id(sysid)) {
                 DataFlash.Log_Write_Message(sysid);
             }
+            DataFlash.Log_Write_Message_P(PSTR("Frame: " FRAME_CONFIG_STRING));
 
             // log the flight mode
-            Log_Write_Mode(control_mode);
+            DataFlash.Log_Write_Mode(control_mode);
         }
         // enable writes
         DataFlash.EnableWrites(true);
@@ -781,17 +685,14 @@ static void start_logging()
 #else // LOGGING_ENABLED
 
 static void Log_Write_Startup() {}
-static void Log_Write_Cmd(uint8_t num, const struct Location *wp) {}
-static void Log_Write_Mode(uint8_t mode) {}
-static void Log_Write_IMU() {}
-static void Log_Write_GPS() {}
 #if AUTOTUNE_ENABLED == ENABLED
-static void Log_Write_AutoTune(uint8_t axis, uint8_t tune_step, float rate_min, float rate_max, float new_gain_rp, float new_gain_rd, float new_gain_sp) {}
-static void Log_Write_AutoTuneDetails(int16_t angle_cd, float rate_cds) {}
+static void Log_Write_AutoTune(uint8_t axis, uint8_t tune_step, float rate_target, float rate_min, float rate_max, float new_gain_rp, float new_gain_rd, float new_gain_sp) {}
+static void Log_Write_AutoTuneDetails(float angle_cd, float rate_cds) {}
 #endif
 static void Log_Write_Current() {}
-static void Log_Write_Compass() {}
 static void Log_Write_Attitude() {}
+static void Log_Write_Rate() {}
+static void Log_Write_MotBatt() {}
 static void Log_Write_Data(uint8_t id, int16_t value){}
 static void Log_Write_Data(uint8_t id, uint16_t value){}
 static void Log_Write_Data(uint8_t id, int32_t value){}
@@ -802,9 +703,9 @@ static void Log_Write_Optflow() {}
 static void Log_Write_Nav_Tuning() {}
 static void Log_Write_Control_Tuning() {}
 static void Log_Write_Performance() {}
-static void Log_Write_Camera() {}
+static void Log_Write_Cmd(const AP_Mission::Mission_Command &cmd) {}
 static void Log_Write_Error(uint8_t sub_system, uint8_t error_code) {}
-static void Log_Write_Baro(void);
+static void Log_Write_Baro(void) {}
 static int8_t process_logs(uint8_t argc, const Menu::arg *argv) {
     return 0;
 }

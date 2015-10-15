@@ -97,8 +97,9 @@ public:
                    RC_Channel&      swash_servo_2,
                    RC_Channel&      swash_servo_3,
                    RC_Channel&      yaw_servo,
+                   uint16_t         loop_rate,
                    uint16_t         speed_hz = AP_MOTORS_HELI_SPEED_DEFAULT) :
-        AP_Motors(rc_roll, rc_pitch, rc_throttle, rc_yaw, speed_hz),
+        AP_Motors(rc_roll, rc_pitch, rc_throttle, rc_yaw, loop_rate, speed_hz),
         _servo_aux(servo_aux),
         _servo_rsc(servo_rotor),
         _servo_1(swash_servo_1),
@@ -108,6 +109,7 @@ public:
         _roll_scaler(1),
         _pitch_scaler(1),
         _collective_scalar(1),
+        _collective_scalar_manual(1),
         _collective_out(0),
         _collective_mid_pwm(0),
         _rotor_desired(0),
@@ -115,7 +117,9 @@ public:
         _rsc_ramp_increment(0.0f),
         _rsc_runup_increment(0.0f),
         _rotor_speed_estimate(0.0f),
-        _tail_direct_drive_out(0)
+        _tail_direct_drive_out(0),
+        _dt(0.01f),
+        _delta_phase_angle(0)
     {
 		AP_Param::setup_object_defaults(this, var_info);
 
@@ -138,8 +142,10 @@ public:
     // output_min - sends minimum values out to the motors
     void output_min();
 
-    // output_test - wiggle servos in order to show connections are correct
-    void output_test();
+    // output_test - spin a motor at the pwm value specified
+    //  motor_seq is the motor's sequence number from 1 to the number of motors on the frame
+    //  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
+    virtual void        output_test(uint8_t motor_seq, int16_t pwm);
 
     //
     // heli specific methods
@@ -187,12 +193,24 @@ public:
 
     // var_info for holding Parameter information
     static const struct AP_Param::GroupInfo var_info[];
+    
+    // set_dt for setting main loop rate time
+    void set_dt(float dt) { _dt = dt; }
+    
+    // set_delta_phase_angle for setting variable phase angle compensation and force
+    // recalculation of collective factors
+    void set_delta_phase_angle(int16_t angle);
+
+    // get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+    //  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+    virtual uint16_t    get_motor_mask();
 
 protected:
 
     // output - sends commands to the motors
-    void output_armed();
-    void output_disarmed();
+    void                output_armed_stabilizing();
+    void                output_armed_not_stabilizing();
+    void                output_disarmed();
 
 private:
 
@@ -281,6 +299,8 @@ private:
     float           _rsc_runup_increment;       // the amount we can increase the rotor's estimated speed during each 100hz iteration
     float           _rotor_speed_estimate;      // estimated speed of the main rotor (0~1000)
     int16_t         _tail_direct_drive_out;     // current ramped speed of output on ch7 when using direct drive variable pitch tail type
+    float           _dt;                        // main loop time
+    int16_t         _delta_phase_angle;         // phase angle dynamic compensation
 };
 
 #endif  // AP_MOTORSHELI

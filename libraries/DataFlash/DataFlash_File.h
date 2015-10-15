@@ -10,7 +10,7 @@
 #ifndef DataFlash_File_h
 #define DataFlash_File_h
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
 #include <systemlib/perf_counter.h>
 #else
 #define perf_begin(x)
@@ -58,6 +58,7 @@ private:
     uint32_t _read_offset;
     uint32_t _write_offset;
     volatile bool _initialised;
+    volatile bool _open_error;
     const char *_log_directory;
 
     /*
@@ -67,7 +68,7 @@ private:
 
     // write buffer
     uint8_t *_writebuf;
-    const uint16_t _writebuf_size;
+    uint16_t _writebuf_size;
     const uint16_t _writebuf_chunk;
     volatile uint16_t _writebuf_head;
     volatile uint16_t _writebuf_tail;
@@ -83,7 +84,7 @@ private:
 
     void _io_timer(void);
 
-#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4 || CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
     // performance counters
     perf_counter_t  _perf_write;
     perf_counter_t  _perf_fsync;

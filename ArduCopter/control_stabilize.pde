@@ -7,9 +7,6 @@
 // stabilize_init - initialise stabilize controller
 static bool stabilize_init(bool ignore_checks)
 {
-    // initialise filters on roll/pitch input
-    reset_roll_pitch_in_filters(g.rc_1.control_in, g.rc_2.control_in);
-
     // set target altitude to zero for reporting
     // To-Do: make pos controller aware when it's active/inactive so it can always report the altitude error?
     pos_control.set_alt_target(0);
@@ -22,14 +19,13 @@ static bool stabilize_init(bool ignore_checks)
 // should be called at 100hz or more
 static void stabilize_run()
 {
-    int16_t target_roll, target_pitch;
+    float target_roll, target_pitch;
     float target_yaw_rate;
     int16_t pilot_throttle_scaled;
 
     // if not armed or throttle at zero, set throttle to zero and exit immediately
     if(!motors.armed() || g.rc_3.control_in <= 0) {
-        attitude_control.init_targets();
-        attitude_control.set_throttle_out(0, false);
+        attitude_control.set_throttle_out_unstabilized(0,true,g.throttle_filt);
         return;
     }
 
@@ -46,16 +42,11 @@ static void stabilize_run()
     // get pilot's desired throttle
     pilot_throttle_scaled = get_pilot_desired_throttle(g.rc_3.control_in);
 
-    // reset target lean angles and heading while landed
-    if (ap.land_complete) {
-        attitude_control.init_targets();
-    }else{
-        // call attitude controller
-        attitude_control.angle_ef_roll_pitch_rate_ef_yaw(target_roll, target_pitch, target_yaw_rate);
+    // call attitude controller
+    attitude_control.angle_ef_roll_pitch_rate_ef_yaw_smooth(target_roll, target_pitch, target_yaw_rate, get_smoothing_gain());
 
-        // body-frame rate controller is run directly from 100hz loop
-    }
+    // body-frame rate controller is run directly from 100hz loop
 
     // output pilot's throttle
-    attitude_control.set_throttle_out(pilot_throttle_scaled, true);
+    attitude_control.set_throttle_out(pilot_throttle_scaled, true, g.throttle_filt);
 }

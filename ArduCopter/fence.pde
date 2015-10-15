@@ -4,8 +4,6 @@
 
 #if AC_FENCE == ENABLED
 
-uint8_t lim_state = 0, lim_old_state = 0;
-
 // fence_check - ask fence library to check for breaches and initiate the response
 // called at 1hz
 void fence_check()
@@ -22,7 +20,7 @@ void fence_check()
     fence.set_home_distance(home_distance*0.01f);
 
     // check for a breach
-    new_breaches = fence.check_fence();
+    new_breaches = fence.check_fence(pv_alt_above_home(inertial_nav.get_altitude())/100.0f);
 
     // if there is a new breach take action
     if( new_breaches != AC_FENCE_TYPE_NONE ) {
@@ -30,9 +28,9 @@ void fence_check()
         // if the user wants some kind of response and motors are armed
         if(fence.get_action() != AC_FENCE_ACTION_REPORT_ONLY ) {
 
-            // disarm immediately if we think we are on the ground
+            // disarm immediately if we think we are on the ground or in a manual flight mode with zero throttle
             // don't disarm if the high-altitude fence has been broken because it's likely the user has pulled their throttle to zero to bring it down
-            if(manual_flight_mode(control_mode) && g.rc_3.control_in == 0 && !failsafe.radio && ((fence.get_breaches() & AC_FENCE_TYPE_ALT_MAX)== 0)){
+            if (ap.land_complete || (mode_has_manual_throttle(control_mode) && ap.throttle_zero && !failsafe.radio && ((fence.get_breaches() & AC_FENCE_TYPE_ALT_MAX)== 0))){
                 init_disarm_motors();
             }else{
                 // if we are within 100m of the fence, RTL

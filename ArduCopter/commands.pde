@@ -1,138 +1,133 @@
 // -*- tab-width: 4; Mode: C++; c-basic-offset: 4; indent-tabs-mode: nil -*-
 
-static void init_commands()
+/*
+ * the home_state has a number of possible values (see enum HomeState in defines.h's)
+ *   HOME_UNSET             = home is not set, no GPS positions yet received
+ *   HOME_SET_NOT_LOCKED    = home is set to EKF origin or armed location (can be moved)
+ *   HOME_SET_AND_LOCKED    = home has been set by user, cannot be moved except by user initiated do-set-home command
+ */
+
+// checks if we should update ahrs/RTL home position from the EKF
+static void update_home_from_EKF()
 {
-    g.command_index         = NO_COMMAND;
-    command_nav_index       = NO_COMMAND;
-    command_cond_index      = NO_COMMAND;
-    prev_nav_index          = NO_COMMAND;
-    command_cond_queue.id   = NO_COMMAND;
-    command_nav_queue.id    = NO_COMMAND;
-}
-
-// Getters
-// -------
-static struct Location get_cmd_with_index(int i)
-{
-    struct Location temp;
-
-    // Find out proper location in memory by using the start_byte position + the index
-    // --------------------------------------------------------------------------------
-    if (i >= g.command_total) {
-        // we do not have a valid command to load
-        // return a WP with a "Blank" id
-        temp.id = CMD_BLANK;
-
-        // no reason to carry on
-        return temp;
-
-    }else{
-        // we can load a command, we don't process it yet
-        // read WP position
-        uint16_t mem = (WP_START_BYTE) + (i * WP_SIZE);
-
-        temp.id = hal.storage->read_byte(mem);
-
-        mem++;
-        temp.options = hal.storage->read_byte(mem);
-
-        mem++;
-        temp.p1 = hal.storage->read_byte(mem);
-
-        mem++;
-        temp.alt = hal.storage->read_dword(mem);           // alt is stored in CM! Alt is stored relative!
-
-        mem += 4;
-        temp.lat = hal.storage->read_dword(mem);         // lat is stored in decimal * 10,000,000
-
-        mem += 4;
-        temp.lng = hal.storage->read_dword(mem);         // lon is stored in decimal * 10,000,000
+    // exit immediately if home already set
+    if (ap.home_state != HOME_UNSET) {
+        return;
     }
 
-    // Add on home altitude if we are a nav command (or other command with altitude) and stored alt is relative
-    //if((temp.id < MAV_CMD_NAV_LAST || temp.id == MAV_CMD_CONDITION_CHANGE_ALT) && (temp.options & MASK_OPTIONS_RELATIVE_ALT)){
-    //temp.alt += home.alt;
-    //}
+    // move home to current ekf location (this will set home_state to HOME_SET)
+    set_home_to_current_location();
+}
 
-    if(temp.options & WP_OPTION_RELATIVE) {
-        // If were relative, just offset from home
-        temp.lat        +=      home.lat;
-        temp.lng        +=      home.lng;
+// set_home_to_current_location - set home to current GPS location
+static bool set_home_to_current_location() {
+    // get current location from EKF
+    Location temp_loc;
+    if (inertial_nav.get_location(temp_loc)) {
+        return set_home(temp_loc);
+    }
+    return false;
+}
+
+// set_home_to_current_location_and_lock - set home to current location and lock so it cannot be moved
+static bool set_home_to_current_location_and_lock()
+{
+    if (set_home_to_current_location()) {
+        set_home_state(HOME_SET_AND_LOCKED);
+        return true;
+    }
+    return false;
+}
+
+// set_home_and_lock - sets ahrs home (used for RTL) to specified location and locks so it cannot be moved
+//  unless this function is called again
+static bool set_home_and_lock(const Location& loc)
+{
+    if (set_home(loc)) {
+        set_home_state(HOME_SET_AND_LOCKED);
+        return true;
+    }
+    return false;
+}
+
+// set_home - sets ahrs home (used for RTL) to specified location
+//  initialises inertial nav and compass on first call
+//  returns true if home location set successfully
+static bool set_home(const Location& loc)
+{
+    // check location is valid
+    if (loc.lat == 0 && loc.lng == 0) {
+        return false;
     }
 
-    return temp;
-}
+    // set ahrs home (used for RTL)
+    ahrs.set_home(loc);
 
-// Setters
-// -------
-static void set_cmd_with_index(struct Location temp, int i)
-{
+    // init inav and compass declination
+    if (ap.home_state == HOME_UNSET) {
+        // Set compass declination automatically
+        if (g.compass_enabled) {
+            compass.set_initial_location(gps.location().lat, gps.location().lng);
+        }
+        // update navigation scalers.  used to offset the shrinking longitude as we go towards the poles
+        scaleLongDown = longitude_scale(loc);
+        scaleLongUp   = 1.0f/scaleLongDown;
+        // record home is set
+        set_home_state(HOME_SET_NOT_LOCKED);
 
-    i = constrain_int16(i, 0, g.command_total.get());
-
-    // store home as 0 altitude!!!
-    // Home is always a MAV_CMD_NAV_WAYPOINT (16)
-    if (i == 0) {
-        temp.alt = 0;
-        temp.id = MAV_CMD_NAV_WAYPOINT;
+        // log new home position which mission library will pull from ahrs
+        if (should_log(MASK_LOG_CMD)) {
+            AP_Mission::Mission_Command temp_cmd;
+            if (mission.read_cmd_from_storage(0, temp_cmd)) {
+                Log_Write_Cmd(temp_cmd);
+            }
+        }
     }
 
-    uint16_t mem = WP_START_BYTE + (i * WP_SIZE);
-
-    hal.storage->write_byte(mem, temp.id);
-
-    mem++;
-    hal.storage->write_byte(mem, temp.options);
-
-    mem++;
-    hal.storage->write_byte(mem, temp.p1);
-
-    mem++;
-    hal.storage->write_dword(mem, temp.alt);     // Alt is stored in CM!
-
-    mem += 4;
-    hal.storage->write_dword(mem, temp.lat);     // Lat is stored in decimal degrees * 10^7
-
-    mem += 4;
-    hal.storage->write_dword(mem, temp.lng);     // Long is stored in decimal degrees * 10^7
-
-    // Make sure our WP_total
-    if(g.command_total < (i+1))
-        g.command_total.set_and_save(i+1);
+    // return success
+    return true;
 }
 
-static int32_t get_RTL_alt()
+// far_from_EKF_origin - checks if a location is too far from the EKF origin
+//  returns true if too far
+static bool far_from_EKF_origin(const Location& loc)
 {
-    if(g.rtl_altitude <= 0) {
-		return min(current_loc.alt, RTL_ALT_MAX);
-    }else if (g.rtl_altitude < current_loc.alt) {
-		return min(current_loc.alt, RTL_ALT_MAX);
-    }else{
-        return g.rtl_altitude;
+    // check distance to EKF origin
+    const struct Location &ekf_origin = inertial_nav.get_origin();
+    if (get_distance(ekf_origin, loc) > EKF_ORIGIN_MAX_DIST_M) {
+        return true;
+    }
+
+    // close enough to origin
+    return false;
+}
+
+// checks if we should update ahrs/RTL home position from GPS
+static void set_system_time_from_GPS()
+{
+    // exit immediately if system time already set
+    if (ap.system_time_set) {
+        return;
+    }
+
+    // if we have a 3d lock and valid location
+    if (gps.status() >= AP_GPS::GPS_OK_FIX_3D) {
+        // set system clock for log timestamps
+        hal.util->set_system_clock(gps.time_epoch_usec());
+        ap.system_time_set = true;
+        Log_Write_Event(DATA_SYSTEM_TIME_SET);
     }
 }
 
-// run this at setup on the ground
-// -------------------------------
-static void init_home()
+// check_gps_base_pos - sets gps base position (used for RTK only)
+static void check_gps_base_pos()
 {
-    set_home_is_set(true);
-    ahrs.set_home(g_gps->latitude, g_gps->longitude, 0);
-
-    // Save Home to EEPROM
-    // -------------------
-    // no need to save this to EPROM
-    set_cmd_with_index(home, 0);
-
-    inertial_nav.setup_home_position();
-
-    if (g.log_bitmask & MASK_LOG_CMD)
-        Log_Write_Cmd(0, &home);
-
-    // update navigation scalers.  used to offset the shrinking longitude as we go towards the poles
-    scaleLongDown = longitude_scale(home);
-    scaleLongUp   = 1.0f/scaleLongDown;
+    if (!ap.gps_base_pos_set && !motors.armed() && home_is_set()) {
+        // if we're ready to enter RTK mode, then capture current state as home,
+        // and enter RTK fixes
+        if (gps.can_calculate_base_pos()) {
+            gps.calculate_base_pos();
+        }
+        ap.gps_base_pos_set = true;
+    }
 }
-
-
-

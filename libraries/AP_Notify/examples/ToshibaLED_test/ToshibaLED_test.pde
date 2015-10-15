@@ -11,6 +11,9 @@
 #include <AP_Baro.h>
 #include <DataFlash.h>
 #include <GCS_MAVLink.h>
+#include <AP_Mission.h>
+#include <StorageManager.h>
+#include <AP_Terrain.h>
 #include <AP_Declination.h>
 #include <AP_HAL.h>
 #include <AP_HAL_AVR.h>
@@ -22,11 +25,13 @@
 #include <AP_Notify.h>          // Notify library
 #include <ToshibaLED.h>
 #include <AP_AHRS.h>
+#include <AP_NavEKF.h>
 #include <AP_Airspeed.h>
 #include <AP_Vehicle.h>
 #include <AP_ADC_AnalogSource.h>
 #include <AP_Compass.h>
 #include <AP_Declination.h>
+#include <AP_BattMonitor.h>
 
 const AP_HAL::HAL& hal = AP_HAL_BOARD_DRIVER;
 
@@ -92,20 +97,22 @@ void full_spectrum()
     }
 }
 
+#define LED_DIM 0x11
+
 // blink - blink the led at 10hz for 10 seconds
 void blink()
 {
     // set colour to red
-    toshiba_led.set_rgb(TOSHIBA_LED_DIM,0,0);
+    toshiba_led.set_rgb(LED_DIM,0,0);
 
     // full spectrum test
     for (uint8_t c=0; c<=2; c++ ) {
         if (c==0) {
-            toshiba_led.set_rgb(TOSHIBA_LED_DIM,0,0);   // red
+            toshiba_led.set_rgb(LED_DIM,0,0);   // red
         }else if (c==1) {
-            toshiba_led.set_rgb(0,TOSHIBA_LED_DIM,0);   // green
+            toshiba_led.set_rgb(0,LED_DIM,0);   // green
         }else{
-            toshiba_led.set_rgb(0,0,TOSHIBA_LED_DIM);   // blue
+            toshiba_led.set_rgb(0,0,LED_DIM);   // blue
         }
     }
 }

@@ -221,6 +221,15 @@ void Vector3<T>::rotate(enum Rotation rotation)
         tmp = x; x = y; y = -tmp;
         return;
     }
+    case ROTATION_YAW_293_PITCH_68_ROLL_90: {
+        float tmpx = x;
+        float tmpy = y;
+        float tmpz = z;
+        x =  0.143039f * tmpx +  0.368776f * tmpy + -0.918446f * tmpz;
+        y = -0.332133f * tmpx + -0.856289f * tmpy + -0.395546f * tmpz;
+        z = -0.932324f * tmpx +  0.361625f * tmpy +  0.000000f * tmpz;
+        return;
+    }
     }
 }
 
@@ -324,7 +333,7 @@ bool Vector3<T>::operator ==(const Vector3<T> &v) const
 template <typename T>
 bool Vector3<T>::operator !=(const Vector3<T> &v) const
 {
-    return (x!=v.x && y!=v.y && z!=v.z);
+    return (x!=v.x || y!=v.y || z!=v.z);
 }
 
 template <typename T>
@@ -373,3 +382,26 @@ template bool Vector3<float>::operator !=(const Vector3<float> &v) const;
 template bool Vector3<float>::is_nan(void) const;
 template bool Vector3<float>::is_inf(void) const;
 template float Vector3<float>::angle(const Vector3<float> &v) const;
+
+#if HAL_CPU_CLASS >= HAL_CPU_CLASS_75
+template void Vector3<double>::rotate(enum Rotation);
+template float Vector3<double>::length(void) const;
+template Vector3<double> Vector3<double>::operator %(const Vector3<double> &v) const;
+template double Vector3<double>::operator *(const Vector3<double> &v) const;
+template Vector3<double> Vector3<double>::operator *(const Matrix3<double> &m) const;
+template Matrix3<double> Vector3<double>::mul_rowcol(const Vector3<double> &v) const;
+template Vector3<double> &Vector3<double>::operator *=(const double num);
+template Vector3<double> &Vector3<double>::operator /=(const double num);
+template Vector3<double> &Vector3<double>::operator -=(const Vector3<double> &v);
+template Vector3<double> &Vector3<double>::operator +=(const Vector3<double> &v);
+template Vector3<double> Vector3<double>::operator /(const double num) const;
+template Vector3<double> Vector3<double>::operator *(const double num) const;
+template Vector3<double> Vector3<double>::operator +(const Vector3<double> &v) const;
+template Vector3<double> Vector3<double>::operator -(const Vector3<double> &v) const;
+template Vector3<double> Vector3<double>::operator -(void) const;
+template bool Vector3<double>::operator ==(const Vector3<double> &v) const;
+template bool Vector3<double>::operator !=(const Vector3<double> &v) const;
+template bool Vector3<double>::is_nan(void) const;
+template bool Vector3<double>::is_inf(void) const;
+template float Vector3<double>::angle(const Vector3<double> &v) const;
+#endif

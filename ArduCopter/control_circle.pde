@@ -4,12 +4,21 @@
  * control_circle.pde - init and run calls for circle flight mode
  */
 
-// circle_init - initialise circle controller
+// circle_init - initialise circle controller flight mode
 static bool circle_init(bool ignore_checks)
 {
-    if ((GPS_ok() && inertial_nav.position_ok()) || ignore_checks) {
+    if (position_ok() || ignore_checks) {
         circle_pilot_yaw_override = false;
-        circle_nav.init_center();
+
+        // initialize speeds and accelerations
+        pos_control.set_speed_xy(wp_nav.get_speed_xy());
+        pos_control.set_accel_xy(wp_nav.get_wp_acceleration());
+        pos_control.set_speed_z(-g.pilot_velocity_z_max, g.pilot_velocity_z_max);
+        pos_control.set_accel_z(g.pilot_accel_z);
+
+        // initialise circle controller including setting the circle center based on vehicle speed
+        circle_nav.init();
+
         return true;
     }else{
         return false;
@@ -25,9 +34,9 @@ static void circle_run()
 
     // if not auto armed set throttle to zero and exit immediately
     if(!ap.auto_armed || ap.land_complete) {
-        wp_nav.init_loiter_target();
-        attitude_control.init_targets();
-        attitude_control.set_throttle_out(0, false);
+        // To-Do: add some initialisation of position controllers
+        attitude_control.set_throttle_out_unstabilized(0,true,g.throttle_filt);
+        pos_control.set_alt_target_to_current_alt();
         return;
     }
 
@@ -64,7 +73,7 @@ static void circle_run()
     // run altitude controller
     if (sonar_alt_health >= SONAR_ALT_HEALTH_MAX) {
         // if sonar is ok, use surface tracking
-        target_climb_rate = get_throttle_surface_tracking(target_climb_rate, pos_control.get_alt_target(), G_Dt);
+        target_climb_rate = get_surface_tracking_climb_rate(target_climb_rate, pos_control.get_alt_target(), G_Dt);
     }
     // update altitude target and call position controller
     pos_control.set_alt_target_from_climb_rate(target_climb_rate, G_Dt);

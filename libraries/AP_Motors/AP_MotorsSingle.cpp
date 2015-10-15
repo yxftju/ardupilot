@@ -29,29 +29,7 @@ extern const AP_HAL::HAL& hal;
 
 const AP_Param::GroupInfo AP_MotorsSingle::var_info[] PROGMEM = {
     // 0 was used by TB_RATIO
-
-    // @Param: TCRV_ENABLE
-    // @DisplayName: Thrust Curve Enable
-    // @Description: Controls whether a curve is used to linearize the thrust produced by the motors
-    // @User: Advanced
-    // @Values: 0:Disabled,1:Enable
-    AP_GROUPINFO("TCRV_ENABLE", 1, AP_MotorsSingle, _throttle_curve_enabled, THROTTLE_CURVE_ENABLED),
-
-    // @Param: TCRV_MIDPCT
-    // @DisplayName: Thrust Curve mid-point percentage
-    // @Description: Set the pwm position that produces half the maximum thrust of the motors
-    // @User: Advanced
-    // @Range: 20 80
-    // @Increment: 1
-    AP_GROUPINFO("TCRV_MIDPCT", 2, AP_MotorsSingle, _throttle_curve_mid, THROTTLE_CURVE_MID_THRUST),
-
-    // @Param: TCRV_MAXPCT
-    // @DisplayName: Thrust Curve max thrust percentage
-    // @Description: Set to the lowest pwm position that produces the maximum thrust of the motors.  Most motors produce maximum thrust below the maximum pwm value that they accept.
-    // @User: Advanced
-    // @Range: 20 80
-    // @Increment: 1
-    AP_GROUPINFO("TCRV_MAXPCT", 3, AP_MotorsSingle, _throttle_curve_max, THROTTLE_CURVE_MAX_THRUST),
+    // 1,2,3 were used by throttle curve
 
     // @Param: SPIN_ARMED
     // @DisplayName: Motors always spin when armed
@@ -67,21 +45,21 @@ const AP_Param::GroupInfo AP_MotorsSingle::var_info[] PROGMEM = {
     AP_GROUPINFO("REV_ROLL", 6, AP_MotorsSingle, _rev_roll, AP_MOTORS_SING_POSITIVE),
 
     // @Param: REV_PITCH
-    // @DisplayName: Reverse roll feedback 
+    // @DisplayName: Reverse pitch feedback 
     // @Description: Ensure the feedback is negative
     // @Values: -1:Opposite direction,1:Same direction
     AP_GROUPINFO("REV_PITCH", 7, AP_MotorsSingle, _rev_pitch, AP_MOTORS_SING_POSITIVE),
 
-	// @Param: REV_ROLL
-    // @DisplayName: Reverse roll feedback 
+	// @Param: REV_YAW
+    // @DisplayName: Reverse yaw feedback 
     // @Description: Ensure the feedback is negative
     // @Values: -1:Opposite direction,1:Same direction
     AP_GROUPINFO("REV_YAW", 8, AP_MotorsSingle, _rev_yaw, AP_MOTORS_SING_POSITIVE),
 
 	// @Param: SV_SPEED
     // @DisplayName: Servo speed 
-    // @Description: Servo update speed
-    // @Values: -1:Opposite direction,1:Same direction
+    // @Description: Servo update speed in hz
+    // @Values: 50, 125, 250
     AP_GROUPINFO("SV_SPEED", 9, AP_MotorsSingle, _servo_speed, AP_MOTORS_SINGLE_SPEED_DIGITAL_SERVOS),
 
     AP_GROUPEND
@@ -151,41 +129,101 @@ void AP_MotorsSingle::output_min()
     hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_7]), _rc_throttle.radio_min);
 }
 
-// output_armed - sends commands to the motors
-void AP_MotorsSingle::output_armed()
+// get_motor_mask - returns a bitmask of which outputs are being used for motors or servos (1 means being used)
+//  this can be used to ensure other pwm outputs (i.e. for servos) do not conflict
+uint16_t AP_MotorsSingle::get_motor_mask()
+{
+    // single copter uses channels 1,2,3,4 and 7
+    return (1U << 0 | 1U << 1 | 1U << 2 | 1U << 3 | 1U << 6);
+}
+
+void AP_MotorsSingle::output_armed_not_stabilizing()
+{
+    int16_t out_min = _rc_throttle.radio_min + _min_throttle;
+    int16_t motor_out;
+
+    int16_t min_thr = rel_pwm_to_thr_range(_spin_when_armed_ramped);
+
+    // initialize limits flags
+    limit.roll_pitch = true;
+    limit.yaw = true;
+    limit.throttle_lower = false;
+    limit.throttle_upper = false;
+
+    if (_rc_throttle.servo_out <= min_thr) {
+        _rc_throttle.servo_out = min_thr;
+        limit.throttle_lower = true;
+    }
+    if (_rc_throttle.servo_out >= _max_throttle) {
+        _rc_throttle.servo_out = _max_throttle;
+        limit.throttle_upper = true;
+    }
+
+    _rc_throttle.calc_pwm();
+
+    motor_out = _rc_throttle.radio_out;
+
+    // front servo
+    _servo1.servo_out = 0;
+    // right servo
+    _servo2.servo_out = 0;
+    // rear servo
+    _servo3.servo_out = 0;
+    // left servo
+    _servo4.servo_out = 0;
+
+    _servo1.calc_pwm();
+    _servo2.calc_pwm();
+    _servo3.calc_pwm();
+    _servo4.calc_pwm();
+
+    if (motor_out >= out_min) {
+        motor_out = apply_thrust_curve_and_volt_scaling(motor_out, out_min, _rc_throttle.radio_max);
+    }
+
+    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_1]), _servo1.radio_out);
+    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_2]), _servo2.radio_out);
+    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_3]), _servo3.radio_out);
+    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_4]), _servo4.radio_out);
+    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_7]), motor_out);
+}
+
+// sends commands to the motors
+// TODO pull code that is common to output_armed_not_stabilizing into helper functions
+void AP_MotorsSingle::output_armed_stabilizing()
 {
     int16_t out_min = _rc_throttle.radio_min + _min_throttle;
     int16_t motor_out;  // main motor output
 
+    // initialize limits flags
+    limit.roll_pitch = false;
+    limit.yaw = false;
+    limit.throttle_lower = false;
+    limit.throttle_upper = false;
+
     // Throttle is 0 to 1000 only
-    _rc_throttle.servo_out = constrain_int16(_rc_throttle.servo_out, 0, _max_throttle);
+    if (_rc_throttle.servo_out <= _min_throttle) {
+        _rc_throttle.servo_out = _min_throttle;
+            limit.throttle_lower = true;
+        }
+    if (_rc_throttle.servo_out >= _max_throttle) {
+        _rc_throttle.servo_out = _max_throttle;
+        limit.throttle_upper = true;
+    }
 
     // capture desired throttle from receiver
     _rc_throttle.calc_pwm();
 
-    // if we are not sending a throttle output, we cut the motors
-    if(_rc_throttle.servo_out == 0) {
-        // range check spin_when_armed
-        if (_spin_when_armed < 0) {
-            _spin_when_armed = 0;
-        }
-        if (_spin_when_armed > _min_throttle) {
-            _spin_when_armed = _min_throttle;
-        }
-        
-        motor_out = _rc_throttle.radio_min + _spin_when_armed;
-    }else{
-		//motor
-        motor_out = _rc_throttle.radio_out;
+    //motor
+    motor_out = _rc_throttle.radio_out;
 
-		// adjust for throttle curve
-        if( _throttle_curve_enabled ) {
-            motor_out = _throttle_curve.get_y(motor_out);
-        }
+    // adjust for thrust curve and voltage scaling
+    motor_out = apply_thrust_curve_and_volt_scaling(motor_out, out_min, _rc_throttle.radio_max);
 
-        // ensure motor doesn't drop below a minimum value and stop
-        motor_out = max(motor_out, out_min);
-    }
+    // ensure motor doesn't drop below a minimum value and stop
+    motor_out = max(motor_out, out_min);
+
+    // TODO: set limits.roll_pitch and limits.yaw
 
     // front servo
     _servo1.servo_out = _rev_roll*_rc_roll.servo_out + _rev_yaw*_rc_yaw.servo_out;
@@ -216,50 +254,40 @@ void AP_MotorsSingle::output_disarmed()
     output_min();
 }
 
-// output_test - spin each motor for a moment to allow the user to confirm the motor order and spin direction
-void AP_MotorsSingle::output_test()
+// output_test - spin a motor at the pwm value specified
+//  motor_seq is the motor's sequence number from 1 to the number of motors on the frame
+//  pwm value is an actual pwm value that will be output, normally in the range of 1000 ~ 2000
+void AP_MotorsSingle::output_test(uint8_t motor_seq, int16_t pwm)
 {
-    // Send minimum values to all motors
-    output_min();
+    // exit immediately if not armed
+    if (!armed()) {
+        return;
+    }
 
-    // spin main motor
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_7]), _rc_throttle.radio_min + _min_throttle);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_7]), _rc_throttle.radio_min);
-    hal.scheduler->delay(2000);   
-
-    // flap servo 1
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_1]), _servo1.radio_min);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_1]), _servo1.radio_max);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_1]), _servo1.radio_trim);
-    hal.scheduler->delay(2000);
-
-    // flap servo 2
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_2]), _servo2.radio_min);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_2]), _servo2.radio_max);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_2]), _servo2.radio_trim);
-    hal.scheduler->delay(2000);
-
-    // flap servo 3
-	hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_3]), _servo3.radio_min);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_3]), _servo3.radio_max);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_3]), _servo3.radio_trim);
-    hal.scheduler->delay(2000);
-
-    // flap servo 4
-	hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_4]), _servo4.radio_min);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_4]), _servo4.radio_max);
-    hal.scheduler->delay(1000);
-    hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_4]), _servo4.radio_trim);
-
-    // Send minimum values to all motors
-    output_min();
+    // output to motors and servos
+    switch (motor_seq) {
+        case 1:
+            // flap servo 1
+            hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_1]), pwm);
+            break;
+        case 2:
+            // flap servo 2
+            hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_2]), pwm);
+            break;
+        case 3:
+            // flap servo 3
+            hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_3]), pwm);
+            break;
+        case 4:
+            // flap servo 4
+            hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_4]), pwm);
+            break;
+        case 5:
+            // spin main motor
+            hal.rcout->write(pgm_read_byte(&_motor_to_channel_map[AP_MOTORS_MOT_7]), pwm);
+            break;
+        default:
+            // do nothing
+            break;
+    }
 }

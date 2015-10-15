@@ -5,42 +5,19 @@
 #define AUTO_TRIM_DELAY         100 // called at 10hz so 10 seconds
 #define AUTO_DISARMING_DELAY    15  // called at 1hz so 15 seconds
 
+static uint8_t auto_disarming_counter;
+
 // arm_motors_check - checks for pilot input to arm or disarm the copter
 // called at 10hz
 static void arm_motors_check()
 {
     static int16_t arming_counter;
-    bool allow_arming = false;
 
     // ensure throttle is down
     if (g.rc_3.control_in > 0) {
         arming_counter = 0;
         return;
     }
-
-    // allow arming/disarming in fully manual flight modes ACRO, STABILIZE, SPORT and DRIFT
-    if (manual_flight_mode(control_mode)) {
-        allow_arming = true;
-    }
-
-    // allow arming/disarming in Loiter and AltHold if landed
-    if (ap.land_complete && (control_mode == LOITER || control_mode == ALT_HOLD)) {
-        allow_arming = true;
-    }
-
-    // kick out other flight modes
-    if (!allow_arming) {
-        arming_counter = 0;
-        return;
-    }
-
-    #if FRAME_CONFIG == HELI_FRAME
-    // heli specific arming check
-    if (!motors.allow_arming()){
-        arming_counter = 0;
-        return;
-    }
-    #endif  // HELI_FRAME
 
     int16_t tmp = g.rc_4.control_in;
 
@@ -54,12 +31,8 @@ static void arm_motors_check()
 
         // arm the motors and configure for flight
         if (arming_counter == ARM_DELAY && !motors.armed()) {
-            // run pre-arm-checks and display failures
-            pre_arm_checks(true);
-            if(ap.pre_arm_check && arm_checks(true)) {
-                init_arm_motors();
-            }else{
-                // reset arming counter if pre-arm checks fail
+            // reset arming counter if arming fail
+            if (!init_arm_motors(false)) {
                 arming_counter = 0;
             }
         }
@@ -67,10 +40,16 @@ static void arm_motors_check()
         // arm the motors and configure for flight
         if (arming_counter == AUTO_TRIM_DELAY && motors.armed() && control_mode == STABILIZE) {
             auto_trim_counter = 250;
+            // ensure auto-disarm doesn't trigger immediately
+            auto_disarming_counter = 0;
         }
 
     // full left
     }else if (tmp < -4000) {
+        if (!mode_has_manual_throttle(control_mode) && !ap.land_complete) {
+            arming_counter = 0;
+            return;
+        }
 
         // increase the counter to a maximum of 1 beyond the disarm delay
         if( arming_counter <= DISARM_DELAY ) {
@@ -92,16 +71,14 @@ static void arm_motors_check()
 // called at 1hz
 static void auto_disarm_check()
 {
-    static uint8_t auto_disarming_counter;
-
     // exit immediately if we are already disarmed or throttle is not zero
-    if (!motors.armed() || g.rc_3.control_in > 0) {
+    if (!motors.armed() || !ap.throttle_zero) {
         auto_disarming_counter = 0;
         return;
     }
 
     // allow auto disarm in manual flight modes or Loiter/AltHold if we're landed
-    if(manual_flight_mode(control_mode) || (ap.land_complete && (control_mode == LOITER || control_mode == ALT_HOLD))) {
+    if (mode_has_manual_throttle(control_mode) || ap.land_complete) {
         auto_disarming_counter++;
 
         if(auto_disarming_counter >= AUTO_DISARMING_DELAY) {
@@ -114,37 +91,45 @@ static void auto_disarm_check()
 }
 
 // init_arm_motors - performs arming process including initialisation of barometer and gyros
-static void init_arm_motors()
+//  returns false if arming failed because of pre-arm checks, arming checks or a gyro calibration failure
+static bool init_arm_motors(bool arming_from_gcs)
 {
 	// arming marker
     // Flag used to track if we have armed the motors the first time.
     // This is used to decide if we should run the ground_start routine
     // which calibrates the IMU
     static bool did_ground_start = false;
+    static bool in_arm_motors = false;
+
+    // exit immediately if already in this function
+    if (in_arm_motors) {
+        return false;
+    }
+    in_arm_motors = true;
+
+    // run pre-arm-checks and display failures
+    if(!pre_arm_checks(true) || !arm_checks(true, arming_from_gcs)) {
+        AP_Notify::events.arming_failed = true;
+        in_arm_motors = false;
+        return false;
+    }
 
     // disable cpu failsafe because initialising everything takes a while
     failsafe_disable();
 
-    // disable inertial nav errors temporarily
-    inertial_nav.ignore_next_error();
+    // reset battery failsafe
+    set_failsafe_battery(false);
 
-#if LOGGING_ENABLED == ENABLED
-    // start dataflash
-    start_logging();
-#endif
+    // notify that arming will occur (we do this early to give plenty of warning)
+    AP_Notify::flags.armed = true;
+    // call update_notify a few times to ensure the message gets out
+    for (uint8_t i=0; i<=10; i++) {
+        update_notify();
+    }
 
 #if HIL_MODE != HIL_MODE_DISABLED || CONFIG_HAL_BOARD == HAL_BOARD_AVR_SITL
     gcs_send_text_P(SEVERITY_HIGH, PSTR("ARMING MOTORS"));
 #endif
-
-    // we don't want writes to the serial port to cause us to pause
-    // mid-flight, so set the serial ports non-blocking once we arm
-    // the motors
-    hal.uartA->set_blocking_writes(false);
-    hal.uartC->set_blocking_writes(false);
-    if (hal.uartD != NULL) {
-        hal.uartD->set_blocking_writes(false);
-    }
 
     // Remember Orientation
     // --------------------
@@ -152,43 +137,42 @@ static void init_arm_motors()
 
     initial_armed_bearing = ahrs.yaw_sensor;
 
-    // Reset home position
-    // -------------------
-    if (ap.home_is_set) {
-        init_home();
-        calc_distance_and_bearing();
+    // Reset home position if it has already been set before (but not locked)
+    if (ap.home_state == HOME_SET_NOT_LOCKED) {
+        set_home_to_current_location();
     }
+    calc_distance_and_bearing();
 
     if(did_ground_start == false) {
-        did_ground_start = true;
         startup_ground(true);
+        // final check that gyros calibrated successfully
+        if (((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_INS)) && !ins.gyro_calibrated_ok_all()) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Gyro calibration failed"));
+            AP_Notify::flags.armed = false;
+            failsafe_enable();
+            in_arm_motors = false;
+            return false;
+        }
+        did_ground_start = true;
     }
-
-    // fast baro calibration to reset ground pressure
-    init_barometer(false);
 
     // go back to normal AHRS gains
     ahrs.set_fast_gains(false);
 
     // enable gps velocity based centrefugal force compensation
     ahrs.set_correct_centrifugal(true);
-    ahrs.set_armed(true);
+    hal.util->set_soft_armed(true);
 
     // set hover throttle
-    motors.set_mid_throttle(g.throttle_mid);
-
-    // Cancel arming if throttle is raised too high so that copter does not suddenly take off
-    read_radio();
-    if (g.rc_3.control_in > g.throttle_cruise && g.throttle_cruise > 100) {
-        motors.output_min();
-        failsafe_enable();
-        return;
-    }
+    motors.set_hover_throttle(g.throttle_mid);
 
 #if SPRAYER == ENABLED
     // turn off sprayer's test if on
     sprayer.test_pump(false);
 #endif
+
+    // short delay to allow reading of rc inputs
+    delay(30);
 
     // enable output to motors
     output_min();
@@ -199,23 +183,44 @@ static void init_arm_motors()
     // log arming to dataflash
     Log_Write_Event(DATA_ARMED);
 
+    // log flight mode in case it was changed while vehicle was disarmed
+    DataFlash.Log_Write_Mode(control_mode);
+
     // reenable failsafe
     failsafe_enable();
+
+    // perf monitor ignores delay due to arming
+    perf_ignore_this_loop();
+
+    // flag exiting this function
+    in_arm_motors = false;
+
+    // return success
+    return true;
 }
 
 // perform pre-arm checks and set ap.pre_arm_check flag
-static void pre_arm_checks(bool display_failure)
+//  return true if the checks pass successfully
+static bool pre_arm_checks(bool display_failure)
 {
+    // exit immediately if already armed
+    if (motors.armed()) {
+        return true;
+    }
+
     // exit immediately if we've already successfully performed the pre-arm check
     if (ap.pre_arm_check) {
-        return;
+        // run gps checks because results may change and affect LED colour
+        // no need to display failures because arm_checks will do that if the pilot tries to arm
+        pre_arm_gps_checks(false);
+        return true;
     }
 
     // succeed if pre arm checks are disabled
     if(g.arming_check == ARMING_CHECK_NONE) {
         set_pre_arm_check(true);
         set_pre_arm_rc_check(true);
-        return;
+        return true;
     }
 
     // pre-arm rc checks a prerequisite
@@ -224,52 +229,57 @@ static void pre_arm_checks(bool display_failure)
         if (display_failure) {
             gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: RC not calibrated"));
         }
-        return;
+        return false;
     }
-
     // check Baro
     if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_BARO)) {
         // barometer health check
-        if(!barometer.healthy) {
+        if(!barometer.all_healthy()) {
             if (display_failure) {
-                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Baro not healthy"));
+                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Barometer not healthy"));
             }
-            return;
+            return false;
         }
-        // check Baro & inav alt are within 1m
-        if(fabs(inertial_nav.get_altitude() - baro_alt) > 100) {
-            if (display_failure) {
-                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Alt disparity"));
+        // Check baro & inav alt are within 1m if EKF is operating in an absolute position mode.
+        // Do not check if intending to operate in a ground relative height mode as EKF will output a ground relative height
+        // that may differ from the baro height due to baro drift.
+        nav_filter_status filt_status = inertial_nav.get_filter_status();
+        bool using_baro_ref = (!filt_status.flags.pred_horiz_pos_rel && filt_status.flags.pred_horiz_pos_abs);
+        if (using_baro_ref) {
+            if (fabs(inertial_nav.get_altitude() - baro_alt) > PREARM_MAX_ALT_DISPARITY_CM) {
+                if (display_failure) {
+                    gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Altitude disparity"));
+                }
+                return false;
             }
-            return;
         }
     }
 
     // check Compass
     if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_COMPASS)) {
-        // check the compass is healthy
+        // check the primary compass is healthy
         if(!compass.healthy()) {
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Compass not healthy"));
             }
-            return;
+            return false;
         }
 
         // check compass learning is on or offsets have been set
-        Vector3f offsets = compass.get_offsets();
-        if(!compass._learn && offsets.length() == 0) {
+        if(!compass.configured()) {
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Compass not calibrated"));
             }
-            return;
+            return false;
         }
 
         // check for unreasonable compass offsets
-        if(offsets.length() > 500) {
+        Vector3f offsets = compass.get_offsets();
+        if(offsets.length() > COMPASS_OFFSETS_MAX) {
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Compass offsets too high"));
             }
-            return;
+            return false;
         }
 
         // check for unreasonable mag field length
@@ -278,24 +288,45 @@ static void pre_arm_checks(bool display_failure)
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Check mag field"));
             }
-            return;
+            return false;
         }
+
+#if COMPASS_MAX_INSTANCES > 1
+        // check all compasses point in roughly same direction
+        if (compass.get_count() > 1) {
+            Vector3f prime_mag_vec = compass.get_field();
+            prime_mag_vec.normalize();
+            for(uint8_t i=0; i<compass.get_count(); i++) {
+                // get next compass
+                Vector3f mag_vec = compass.get_field(i);
+                mag_vec.normalize();
+                Vector3f vec_diff = mag_vec - prime_mag_vec;
+                if (vec_diff.length() > COMPASS_ACCEPTABLE_VECTOR_DIFF) {
+                    if (display_failure) {
+                        gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: inconsistent compasses"));
+                    }
+                    return false;
+                }
+            }
+        }
+#endif
+
     }
 
     // check GPS
-    if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_GPS)) {
-        // check gps is ok if required - note this same check is repeated again in arm_checks
-        if ((mode_requires_GPS(control_mode) || g.failsafe_gps_enabled == FS_GPS_LAND_EVEN_STABILIZE) && !pre_arm_gps_checks(display_failure)) {
-            return;
-        }
+    if (!pre_arm_gps_checks(display_failure)) {
+        return false;
+    }
 
 #if AC_FENCE == ENABLED
-        // check fence is initialised
-        if(!fence.pre_arm_check() || (((fence.get_enabled_fences() & AC_FENCE_TYPE_CIRCLE) != 0) && !pre_arm_gps_checks(display_failure))) {
-            return;
+    // check fence is initialised
+    if(!fence.pre_arm_check()) {
+        if (display_failure) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: check fence"));
         }
-#endif
+        return false;
     }
+#endif
 
     // check INS
     if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_INS)) {
@@ -304,18 +335,60 @@ static void pre_arm_checks(bool display_failure)
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: INS not calibrated"));
             }
-            return;
+            return false;
         }
 
-        // check accels and gyros are healthy
-        if(!ins.healthy()) {
+        // check accels are healthy
+        if(!ins.get_accel_health_all()) {
             if (display_failure) {
-                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: INS not healthy"));
+                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Accelerometers not healthy"));
             }
-            return;
+            return false;
         }
-    }
 
+#if INS_MAX_INSTANCES > 1
+        // check all accelerometers point in roughly same direction
+        if (ins.get_accel_count() > 1) {
+            const Vector3f &prime_accel_vec = ins.get_accel();
+            for(uint8_t i=0; i<ins.get_accel_count(); i++) {
+                // get next accel vector
+                const Vector3f &accel_vec = ins.get_accel(i);
+                Vector3f vec_diff = accel_vec - prime_accel_vec;
+                if (vec_diff.length() > PREARM_MAX_ACCEL_VECTOR_DIFF) {
+                    if (display_failure) {
+                        gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: inconsistent Accelerometers"));
+                    }
+                    return false;
+                }
+            }
+        }
+#endif
+
+        // check gyros are healthy
+        if(!ins.get_gyro_health_all()) {
+            if (display_failure) {
+                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Gyros not healthy"));
+            }
+            return false;
+        }
+
+#if INS_MAX_INSTANCES > 1
+        // check all gyros are consistent
+        if (ins.get_gyro_count() > 1) {
+            for(uint8_t i=0; i<ins.get_gyro_count(); i++) {
+                // get rotation rate difference between gyro #i and primary gyro
+                Vector3f vec_diff = ins.get_gyro(i) - ins.get_gyro();
+                if (vec_diff.length() > PREARM_MAX_GYRO_VECTOR_DIFF) {
+                    if (display_failure) {
+                        gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: inconsistent Gyros"));
+                    }
+                    return false;
+                }
+            }
+        }
+#endif
+    }
+#if CONFIG_HAL_BOARD != HAL_BOARD_VRBRAIN
 #ifndef CONFIG_ARCH_BOARD_PX4FMU_V1
     // check board voltage
     if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_VOLTAGE)) {
@@ -323,20 +396,21 @@ static void pre_arm_checks(bool display_failure)
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Check Board Voltage"));
             }
-            return;
+            return false;
         }
     }
+#endif
 #endif
 
     // check various parameter values
     if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_PARAMETERS)) {
 
         // ensure ch7 and ch8 have different functions
-        if ((g.ch7_option != 0 || g.ch8_option != 0) && g.ch7_option == g.ch8_option) {
+        if (check_duplicate_auxsw()) {
             if (display_failure) {
-                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Ch7&Ch8 Opt cannot be same"));
+                gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Duplicate Aux Switch Options"));
             }
-            return;
+            return false;
         }
 
         // failsafe parameter checks
@@ -346,16 +420,16 @@ static void pre_arm_checks(bool display_failure)
                 if (display_failure) {
                     gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Check FS_THR_VALUE"));
                 }
-                return;
+                return false;
             }
         }
 
         // lean angle parameter check
-    if (aparm.angle_max < 1000 || aparm.angle_max > 8000) {
+        if (aparm.angle_max < 1000 || aparm.angle_max > 8000) {
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Check ANGLE_MAX"));
             }
-            return;
+            return false;
         }
 
         // acro balance parameter check
@@ -363,12 +437,13 @@ static void pre_arm_checks(bool display_failure)
             if (display_failure) {
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: ACRO_BAL_ROLL/PITCH"));
             }
-            return;
+            return false;
         }
     }
 
     // if we've gotten this far then pre arm checks have completed
     set_pre_arm_check(true);
+    return true;
 }
 
 // perform pre_arm_rc_checks checks and set ap.pre_arm_rc_check flag
@@ -400,6 +475,16 @@ static void pre_arm_rc_checks()
         return;
     }
 
+    // check channels 1 & 2 have trim >= 1300 and <= 1700
+    if (g.rc_1.radio_trim < 1300 || g.rc_1.radio_trim > 1700 || g.rc_2.radio_trim < 1300 || g.rc_2.radio_trim > 1700) {
+        return;
+    }
+
+    // check channel 4 has trim >= 1300 and <= 1700
+    if (g.rc_4.radio_trim < 1300 || g.rc_4.radio_trim > 1700) {
+        return;
+    }
+
     // if we've gotten this far rc is ok
     set_pre_arm_rc_check(true);
 }
@@ -407,63 +492,127 @@ static void pre_arm_rc_checks()
 // performs pre_arm gps related checks and returns true if passed
 static bool pre_arm_gps_checks(bool display_failure)
 {
-    float speed_cms = inertial_nav.get_velocity().length();     // speed according to inertial nav in cm/s
-
-    // ensure GPS is ok and our speed is below 50cm/s
-    if (!GPS_ok() || gps_glitch.glitching() || speed_cms == 0 || speed_cms > PREARM_MAX_VELOCITY_CMS) {
+    // always check if inertial nav has started and is ready
+    if(!ahrs.healthy()) {
         if (display_failure) {
-            gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Bad GPS Pos"));
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Waiting for Nav Checks"));
         }
+        return false;
+    }
+
+    // return true immediately if gps check is disabled
+    if (!(g.arming_check == ARMING_CHECK_ALL || g.arming_check & ARMING_CHECK_GPS)) {
+        AP_Notify::flags.pre_arm_gps_check = true;
+        return true;
+    }
+
+    // check if flight mode requires GPS
+    bool gps_required = mode_requires_GPS(control_mode);
+
+#if AC_FENCE == ENABLED
+    // if circular fence is enabled we need GPS
+    if ((fence.get_enabled_fences() & AC_FENCE_TYPE_CIRCLE) != 0) {
+        gps_required = true;
+    }
+#endif
+
+    // return true if GPS is not required
+    if (!gps_required) {
+        AP_Notify::flags.pre_arm_gps_check = true;
+        return true;
+    }
+
+    // ensure GPS is ok
+    if (!position_ok()) {
+        if (display_failure) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: Need 3D Fix"));
+        }
+        AP_Notify::flags.pre_arm_gps_check = false;
+        return false;
+    }
+
+    // check home and EKF origin are not too far
+    if (far_from_EKF_origin(ahrs.get_home())) {
+        if (display_failure) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: EKF-home variance"));
+        }
+        AP_Notify::flags.pre_arm_gps_check = false;
         return false;
     }
 
     // warn about hdop separately - to prevent user confusion with no gps lock
-    if (g_gps->hdop > g.gps_hdop_good) {
+    if (gps.get_hdop() > g.gps_hdop_good) {
         if (display_failure) {
             gcs_send_text_P(SEVERITY_HIGH,PSTR("PreArm: High GPS HDOP"));
         }
+        AP_Notify::flags.pre_arm_gps_check = false;
         return false;
     }
 
     // if we got here all must be ok
+    AP_Notify::flags.pre_arm_gps_check = true;
     return true;
 }
 
 // arm_checks - perform final checks before arming
-// always called just before arming.  Return true if ok to arm
-static bool arm_checks(bool display_failure)
+//  always called just before arming.  Return true if ok to arm
+//  has side-effect that logging is started
+static bool arm_checks(bool display_failure, bool arming_from_gcs)
 {
+#if LOGGING_ENABLED == ENABLED
+    // start dataflash
+    start_logging();
+#endif
+
+    // always check if inertial nav has started and is ready
+    if(!ahrs.healthy()) {
+        if (display_failure) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Waiting for Nav Checks"));
+        }
+        return false;
+    }
+
+    // always check if the current mode allows arming
+    if (!mode_allows_arming(control_mode, arming_from_gcs)) {
+        if (display_failure) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Mode not armable"));
+        }
+        return false;
+    }
+
+    // always check if rotor is spinning on heli
+    #if FRAME_CONFIG == HELI_FRAME
+    // heli specific arming check
+    if (!motors.allow_arming()){
+        if (display_failure) {
+            gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Rotor not spinning"));
+        }
+        return false;
+    }
+    #endif  // HELI_FRAME
+
     // succeed if arming checks are disabled
     if (g.arming_check == ARMING_CHECK_NONE) {
         return true;
     }
 
-    // check Baro & inav alt are within 1m
-    if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_BARO)) {
-        if(fabs(inertial_nav.get_altitude() - baro_alt) > 100) {
+    // Check baro & inav alt are within 1m if EKF is operating in an absolute position mode.
+    // Do not check if intending to operate in a ground relative height mode as EKF will output a ground relative height
+    // that may differ from the baro height due to baro drift.
+    nav_filter_status filt_status = inertial_nav.get_filter_status();
+    bool using_baro_ref = (!filt_status.flags.pred_horiz_pos_rel && filt_status.flags.pred_horiz_pos_abs);
+    if (((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_BARO)) && using_baro_ref) {
+        if (fabs(inertial_nav.get_altitude() - baro_alt) > PREARM_MAX_ALT_DISPARITY_CM) {
             if (display_failure) {
-                gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Alt disparity"));
+                gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Altitude disparity"));
             }
             return false;
         }
     }
 
-    // check gps is ok if required - note this same check is also done in pre-arm checks
-    if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_GPS)) {
-        if ((mode_requires_GPS(control_mode) || g.failsafe_gps_enabled == FS_GPS_LAND_EVEN_STABILIZE) && !pre_arm_gps_checks(display_failure)) {
-            return false;
-        }
-    }
-
-    // check parameters
-    if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_PARAMETERS)) {
-        // check throttle is above failsafe throttle
-        if (g.failsafe_throttle != FS_THR_DISABLED && g.rc_3.radio_in < g.failsafe_throttle_value) {
-            if (display_failure) {
-                gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Thr below FS"));
-            }
-            return false;
-        }
+    // check gps
+    if (!pre_arm_gps_checks(display_failure)) {
+        return false;
     }
 
     // check lean angle
@@ -473,6 +622,35 @@ static bool arm_checks(bool display_failure)
                 gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Leaning"));
             }
             return false;
+        }
+    }
+
+    // check throttle
+    if ((g.arming_check == ARMING_CHECK_ALL) || (g.arming_check & ARMING_CHECK_RC)) {
+        // check throttle is not too low - must be above failsafe throttle
+        if (g.failsafe_throttle != FS_THR_DISABLED && g.rc_3.radio_in < g.failsafe_throttle_value) {
+            if (display_failure) {
+                gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Throttle below Failsafe"));
+            }
+            return false;
+        }
+
+        // check throttle is not too high - skips checks if arming from GCS in Guided
+        if (!(arming_from_gcs && control_mode == GUIDED)) {
+            // above top of deadband is too always high
+            if (g.rc_3.control_in > (g.rc_3.get_control_mid() + g.throttle_deadzone)) {
+                if (display_failure) {
+                    gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Throttle too high"));
+                }
+                return false;
+            }
+            // in manual modes throttle must be at zero
+            if ((mode_has_manual_throttle(control_mode) || control_mode == DRIFT) && g.rc_3.control_in > 0) {
+                if (display_failure) {
+                    gcs_send_text_P(SEVERITY_HIGH,PSTR("Arm: Throttle too high"));
+                }
+                return false;
+            }
         }
     }
 
@@ -502,12 +680,11 @@ static void init_disarm_motors()
 
     motors.armed(false);
 
-    // disable inertial nav errors temporarily
-    inertial_nav.ignore_next_error();
-
-    compass.save_offsets();
-
-    g.throttle_cruise.save();
+    // save compass offsets learned by the EKF
+    Vector3f magOffsets;
+    if (ahrs.use_compass() && ahrs.getMagOffsets(magOffsets)) {
+        compass.set_and_save_offsets(compass.get_primary(), magOffsets);
+    }
 
 #if AUTOTUNE_ENABLED == ENABLED
     // save auto tuned parameters
@@ -516,7 +693,11 @@ static void init_disarm_motors()
 
     // we are not in the air
     set_land_complete(true);
-    
+    set_land_complete_maybe(true);
+
+    // reset the mission
+    mission.reset();
+
     // setup fast AHRS gains to get right attitude
     ahrs.set_fast_gains(true);
 
@@ -524,53 +705,22 @@ static void init_disarm_motors()
     Log_Write_Event(DATA_DISARMED);
 
     // suspend logging
-    DataFlash.EnableWrites(false);
+    if (!(g.log_bitmask & MASK_LOG_WHEN_DISARMED)) {
+        DataFlash.EnableWrites(false);
+    }
 
     // disable gps velocity based centrefugal force compensation
     ahrs.set_correct_centrifugal(false);
-    ahrs.set_armed(false);
+    hal.util->set_soft_armed(false);
 }
 
-/*****************************************
-* Set the flight control servos based on the current calculated values
-*****************************************/
-static void
-set_servos_4()
+// motors_output - send output to motors library which will adjust and send to ESCs and servos
+static void motors_output()
 {
-#if FRAME_CONFIG == TRI_FRAME
-    // To-Do: implement improved stability patch for tri so that we do not need to limit throttle input to motors
-    g.rc_3.servo_out = min(g.rc_3.servo_out, 800);
-#endif
-    motors.output();
-}
-
-// servo_write - writes to a servo after checking the channel is not used for a motor
-static void servo_write(uint8_t ch, uint16_t pwm)
-{
-    bool servo_ok = false;
-
-    #if (FRAME_CONFIG == QUAD_FRAME || FRAME_CONFIG == COAX_FRAME)
-        // Quads can use RC5 and higher as servos
-        if (ch >= CH_5) servo_ok = true;
-    #elif (FRAME_CONFIG == TRI_FRAME || FRAME_CONFIG == SINGLE_FRAME)
-        // Tri's and Singles can use RC5, RC6, RC8 and higher
-        if (ch == CH_5 || ch == CH_6 || ch >= CH_8) servo_ok = true;
-    #elif (FRAME_CONFIG == HEXA_FRAME || FRAME_CONFIG == Y6_FRAME)
-        // Hexa and Y6 can use RC7 and higher
-        if (ch >= CH_7) servo_ok = true;
-    #elif (FRAME_CONFIG == OCTA_FRAME || FRAME_CONFIG == OCTA_QUAD_FRAME)
-        // Octa and X8 can use RC9 and higher
-        if (ch >= CH_9) servo_ok = true;
-    #elif (FRAME_CONFIG == HELI_FRAME)
-        // Heli's can use RC5, RC6, RC7, not RC8, and higher
-        if (ch == CH_5 || ch == CH_6 || ch == CH_7 || ch >= CH_9) servo_ok = true;
-    #else
-        // throw compile error if frame type is unrecognise
-        #error Unrecognised frame type
-    #endif
-
-    if (servo_ok) {
-        hal.rcout->enable_ch(ch);
-        hal.rcout->write(ch, pwm);
+    // check if we are performing the motor test
+    if (ap.motor_test) {
+        motor_test_output();
+    } else {
+        motors.output();
     }
 }

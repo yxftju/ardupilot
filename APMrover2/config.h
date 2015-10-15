@@ -49,51 +49,36 @@
 #define DISABLED		0
 
 //////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////////
-// HARDWARE CONFIGURATION AND CONNECTIONS
-//////////////////////////////////////////////////////////////////////////////
-//////////////////////////////////////////////////////////////////////////////
+// sensor types
 
 //////////////////////////////////////////////////////////////////////////////
-// LED and IO Pins
-//
+// HIL_MODE                                 OPTIONAL
+
+#ifndef HIL_MODE
+ #define HIL_MODE        HIL_MODE_DISABLED
+#endif
+
 #if CONFIG_HAL_BOARD == HAL_BOARD_APM1
-# define CONFIG_INS_TYPE   CONFIG_INS_OILPAN
-# define CONFIG_COMPASS  AP_COMPASS_HMC5843
 # define BATTERY_PIN_1	  0
 # define CURRENT_PIN_1	  1
 #elif CONFIG_HAL_BOARD == HAL_BOARD_APM2
-# define CONFIG_INS_TYPE   CONFIG_INS_MPU6000
-# define CONFIG_COMPASS  AP_COMPASS_HMC5843
 # define BATTERY_PIN_1	  1
 # define CURRENT_PIN_1	  2
 #elif CONFIG_HAL_BOARD == HAL_BOARD_AVR_SITL
-# define CONFIG_INS_TYPE CONFIG_INS_HIL
-# define CONFIG_COMPASS  AP_COMPASS_HIL
 # define BATTERY_PIN_1	  1
 # define CURRENT_PIN_1	  2
 #elif CONFIG_HAL_BOARD == HAL_BOARD_PX4
-# define CONFIG_INS_TYPE   CONFIG_INS_PX4
-# define CONFIG_COMPASS  AP_COMPASS_PX4
 # define BATTERY_PIN_1	  -1
 # define CURRENT_PIN_1	  -1
 #elif CONFIG_HAL_BOARD == HAL_BOARD_FLYMAPLE
-# define CONFIG_INS_TYPE   CONFIG_INS_FLYMAPLE
-# define CONFIG_COMPASS  AP_COMPASS_HMC5843
 # define BATTERY_PIN_1     20
 # define CURRENT_PIN_1	   19
 #elif CONFIG_HAL_BOARD == HAL_BOARD_LINUX
-# define CONFIG_INS_TYPE   CONFIG_INS_L3G4200D
-# define CONFIG_COMPASS  AP_COMPASS_HMC5843
 # define BATTERY_PIN_1     -1
 # define CURRENT_PIN_1	   -1
-#endif
-
-//////////////////////////////////////////////////////////////////////////////
-// IMU Selection
-//
-#ifndef CONFIG_INS_TYPE
-# define CONFIG_INS_TYPE CONFIG_INS_OILPAN
+#elif CONFIG_HAL_BOARD == HAL_BOARD_VRBRAIN
+# define BATTERY_PIN_1	  -1
+# define CURRENT_PIN_1	  -1
 #endif
 
 //////////////////////////////////////////////////////////////////////////////
@@ -103,41 +88,23 @@
 #define HIL_MODE	HIL_MODE_DISABLED
 #endif
 
-#if HIL_MODE != HIL_MODE_DISABLED       // we are in HIL mode
- #undef GPS_PROTOCOL
- #define GPS_PROTOCOL GPS_PROTOCOL_HIL
- #undef CONFIG_INS_TYPE
- #define CONFIG_INS_TYPE CONFIG_INS_HIL
- #undef  CONFIG_COMPASS
- #define CONFIG_COMPASS  AP_COMPASS_HIL
-#endif
-
-//////////////////////////////////////////////////////////////////////////////
-// GPS_PROTOCOL
-//
-// Note that this test must follow the HIL_PROTOCOL block as the HIL
-// setup may override the GPS configuration.
-//
-#ifndef GPS_PROTOCOL
-# define GPS_PROTOCOL GPS_PROTOCOL_AUTO
-#endif
-
 #ifndef MAV_SYSTEM_ID
 # define MAV_SYSTEM_ID		1
 #endif
 
+
 //////////////////////////////////////////////////////////////////////////////
-// Serial port speeds.
+// FrSky telemetry support
 //
-#ifndef SERIAL0_BAUD
-# define SERIAL0_BAUD			115200
+
+#ifndef FRSKY_TELEM_ENABLED
+#if CONFIG_HAL_BOARD == HAL_BOARD_APM1 || CONFIG_HAL_BOARD == HAL_BOARD_APM2
+ # define FRSKY_TELEM_ENABLED DISABLED
+#else
+ # define FRSKY_TELEM_ENABLED ENABLED
 #endif
-#ifndef SERIAL1_BAUD
-# define SERIAL1_BAUD			 57600
 #endif
-#ifndef SERIAL2_BAUD
-# define SERIAL2_BAUD			 57600
-#endif
+
 
 #ifndef CH7_OPTION
 # define CH7_OPTION		          CH7_SAVE_WP
@@ -357,7 +324,11 @@
 
 // use this to completely disable the CLI
 #ifndef CLI_ENABLED
+#if HAL_CPU_CLASS > HAL_CPU_CLASS_16
 # define CLI_ENABLED ENABLED
+#else
+# define CLI_ENABLED DISABLED
+#endif
 #endif
 
 // if RESET_SWITCH_CH is not zero, then this is the PWM value on

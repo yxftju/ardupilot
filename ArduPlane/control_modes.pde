@@ -16,6 +16,11 @@ static void read_control_switch()
         return;
     }
 
+    if (hal.scheduler->millis() - failsafe.last_valid_rc_ms > 100) {
+        // only use signals that are less than 0.1s old.
+        return;
+    }
+
     // we look for changes in the switch position. If the
     // RST_SWITCH_CH parameter is set, then it is a switch that can be
     // used to force re-reading of the control switch. This is useful
@@ -38,14 +43,13 @@ static void read_control_switch()
         set_mode((enum FlightMode)(flight_modes[switchPosition].get()));
 
         oldSwitchPosition = switchPosition;
-        prev_WP = current_loc;
+        prev_WP_loc = current_loc;
     }
 
     if (g.reset_mission_chan != 0 &&
         hal.rcin->read(g.reset_mission_chan-1) > RESET_SWITCH_CHAN_PWM) {
-        // reset to first waypoint in mission
-        prev_WP = current_loc;
-        change_command(0);
+        mission.start();
+        prev_WP_loc = current_loc;
     }
 
     switch_debouncer = false;
@@ -55,11 +59,52 @@ static void read_control_switch()
         // fly upside down when that channel goes above INVERTED_FLIGHT_PWM
         inverted_flight = (control_mode != MANUAL && hal.rcin->read(g.inverted_flight_ch-1) > INVERTED_FLIGHT_PWM);
     }
+
+#if CONFIG_HAL_BOARD == HAL_BOARD_PX4
+    if (g.override_channel > 0) {
+        // if the user has configured an override channel then check it
+        bool override = (hal.rcin->read(g.override_channel-1) >= PX4IO_OVERRIDE_PWM);
+        if (override && !px4io_override_enabled) {
+            // we only update the mixer if we are not armed. This is
+            // important as otherwise we will need to temporarily
+            // disarm to change the mixer
+            if (hal.util->get_soft_armed() || setup_failsafe_mixing()) {
+                px4io_override_enabled = true;
+                // disable output channels to force PX4IO override
+                for (uint8_t i=0; i<16; i++) {
+                    hal.rcout->disable_ch(i);
+                }
+                gcs_send_text_P(SEVERITY_LOW, PSTR("PX4IO Override enabled"));
+            } else {
+                // we'll try again next loop. The PX4IO code sometimes
+                // rejects a mixer, probably due to it being busy in
+                // some way?
+                gcs_send_text_P(SEVERITY_LOW, PSTR("PX4IO Override enable failed"));
+            }
+        } else if (!override && px4io_override_enabled) {
+            px4io_override_enabled = false;
+            // re-enable output channels
+            for (uint8_t i=0; i<8; i++) {
+                hal.rcout->enable_ch(i);
+            }
+            RC_Channel_aux::enable_aux_servos();
+            gcs_send_text_P(SEVERITY_LOW, PSTR("PX4IO Override disabled"));
+        }
+        if (px4io_override_enabled && 
+            hal.util->safety_switch_state() != AP_HAL::Util::SAFETY_ARMED) {
+            // we force safety off, so that if this override is used
+            // with a in-flight reboot it gives a way for the pilot to
+            // re-arm and take manual control
+            hal.rcout->force_safety_off();
+        }
+    }
+#endif // CONFIG_HAL_BOARD
 }
 
-static uint8_t readSwitch(void){
+static uint8_t readSwitch(void)
+{
     uint16_t pulsewidth = hal.rcin->read(g.flight_mode_channel - 1);
-    if (pulsewidth <= 800 || pulsewidth >= 2200) return 255;            // This is an error condition
+    if (pulsewidth <= 900 || pulsewidth >= 2200) return 255;            // This is an error condition
     if (pulsewidth > 1230 && pulsewidth <= 1360) return 1;
     if (pulsewidth > 1360 && pulsewidth <= 1490) return 2;
     if (pulsewidth > 1490 && pulsewidth <= 1620) return 3;
@@ -74,3 +119,35 @@ static void reset_control_switch()
     read_control_switch();
 }
 
+/*
+  called when entering autotune
+ */
+static void autotune_start(void)
+{
+    rollController.autotune_start();
+    pitchController.autotune_start();
+}
+
+/*
+  called when exiting autotune
+ */
+static void autotune_restore(void)
+{
+    rollController.autotune_restore();
+    pitchController.autotune_restore();
+}
+
+/*
+  are we flying inverted?
+ */
+static bool fly_inverted(void)
+{
+    if (g.inverted_flight_ch != 0 && inverted_flight) {
+        // controlled with INVERTED_FLIGHT_CH
+        return true;
+    }
+    if (control_mode == AUTO && auto_state.inverted_flight) {
+        return true;
+    }
+    return false;
+}

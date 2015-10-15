@@ -2,20 +2,28 @@
 
 #if CLI_ENABLED == ENABLED
 
+#if HAL_CPU_CLASS >= HAL_CPU_CLASS_75
+#define WITH_ESC_CALIB
+#endif
+
 // Functions called from the setup menu
 static int8_t   setup_factory           (uint8_t argc, const Menu::arg *argv);
-static int8_t   setup_set               (uint8_t argc, const Menu::arg *argv);
 static int8_t   setup_show              (uint8_t argc, const Menu::arg *argv);
-static int8_t   setup_sonar             (uint8_t argc, const Menu::arg *argv);
-
+static int8_t   setup_set               (uint8_t argc, const Menu::arg *argv);
+#ifdef WITH_ESC_CALIB
+static int8_t   esc_calib               (uint8_t argc, const Menu::arg *argv);
+#endif
 
 // Command/function table for the setup menu
 const struct Menu::command setup_menu_commands[] PROGMEM = {
     // command			function called
     // =======          ===============
     {"reset",                       setup_factory},
-    {"set",                         setup_set},
     {"show",                        setup_show},
+    {"set",                         setup_set},
+#ifdef WITH_ESC_CALIB
+    {"esc_calib",                   esc_calib},
+#endif
 };
 
 // Create the setup menu object.
@@ -28,38 +36,8 @@ setup_mode(uint8_t argc, const Menu::arg *argv)
     // Give the user some guidance
     cliSerial->printf_P(PSTR("Setup Mode\n\n\n"));
 
-    if(g.rc_1.radio_min >= 1300) {
-        delay(1000);
-        cliSerial->printf_P(PSTR("\n!Warning, radio not configured!"));
-        delay(1000);
-        cliSerial->printf_P(PSTR("\n Type 'radio' now.\n\n"));
-    }
-
     // Run the setup menu.  When the menu exits, we will return to the main menu.
     setup_menu.run();
-    return 0;
-}
-
-static int8_t
-setup_optflow(uint8_t argc, const Menu::arg *argv)
-{
- #if OPTFLOW == ENABLED
-    if (!strcmp_P(argv[1].str, PSTR("on"))) {
-        g.optflow_enabled = true;
-        init_optflow();
-
-    } else if (!strcmp_P(argv[1].str, PSTR("off"))) {
-        g.optflow_enabled = false;
-
-    }else{
-        cliSerial->printf_P(PSTR("\nOp:[on, off]\n"));
-        report_optflow();
-        return 0;
-    }
-
-    g.optflow_enabled.save();
-    report_optflow();
- #endif     // OPTFLOW == ENABLED
     return 0;
 }
 
@@ -179,7 +157,6 @@ setup_show(uint8_t argc, const Menu::arg *argv)
     report_radio();
     report_frame();
     report_batt_monitor();
-    report_sonar();
     report_flight_modes();
     report_ins();
     report_compass();
@@ -190,6 +167,153 @@ setup_show(uint8_t argc, const Menu::arg *argv)
     return(0);
 }
 
+#ifdef WITH_ESC_CALIB
+#define PWM_CALIB_MIN 1000
+#define PWM_CALIB_MAX 2000
+#define PWM_HIGHEST_MAX 2200
+#define PWM_LOWEST_MAX 1200
+#define PWM_HIGHEST_MIN 1800
+#define PWM_LOWEST_MIN 800
+
+static int8_t
+esc_calib(uint8_t argc,const Menu::arg *argv)
+{
+
+
+	char c;
+	unsigned max_channels = 0;
+	uint32_t set_mask = 0;
+
+	uint16_t pwm_high = PWM_CALIB_MAX;
+	uint16_t pwm_low = PWM_CALIB_MIN;
+
+
+	if (argc < 2) {
+		cliSerial->printf_P(PSTR("Pls provide Channel Mask\n"
+                                    "\tusage: esc_calib 1010 - enables calibration for 2nd and 4th Motor\n"));
+        return(0);
+	}
+    
+
+	
+    set_mask = strtol (argv[1].str, NULL, 2);
+	if (set_mask == 0)
+		cliSerial->printf_P(PSTR("no channels chosen"));
+    //cliSerial->printf_P(PSTR("\n%d\n"),set_mask);
+    set_mask<<=1;
+	/* wait 50 ms */
+	hal.scheduler->delay(50);
+
+
+	cliSerial->printf_P(PSTR("\nATTENTION, please remove or fix propellers before starting calibration!\n"
+	       "\n"
+	       "Make sure\n"
+	       "\t - that the ESCs are not powered\n"
+	       "\t - that safety is off\n"
+	       "\t - that the controllers are stopped\n"
+	       "\n"
+	       "Do you want to start calibration now: y or n?\n"));
+
+	/* wait for user input */
+	while (1) {
+            c= cliSerial->read();
+			if (c == 'y' || c == 'Y') {
+
+				break;
+
+			} else if (c == 0x03 || c == 0x63 || c == 'q') {
+				cliSerial->printf_P(PSTR("ESC calibration exited\n"));
+				return(0);
+
+			} else if (c == 'n' || c == 'N') {
+				cliSerial->printf_P(PSTR("ESC calibration aborted\n"));
+				return(0);
+
+			} 
+
+		/* rate limit to ~ 20 Hz */
+		hal.scheduler->delay(50);
+	}
+
+
+	/* get number of channels available on the device */
+	max_channels = AP_MOTORS_MAX_NUM_MOTORS;
+
+	/* tell IO/FMU that the system is armed (it will output values if safety is off) */
+	motors.armed(true);
+
+
+	cliSerial->printf_P(PSTR("Outputs armed\n"));
+
+
+	/* wait for user confirmation */
+	cliSerial->printf_P(PSTR("\nHigh PWM set: %d\n"
+	       "\n"
+	       "Connect battery now and hit c+ENTER after the ESCs confirm the first calibration step\n"
+	       "\n"), pwm_high);
+
+	while (1) {
+		/* set max PWM */
+		for (unsigned i = 0; i < max_channels; i++) {
+
+			if (set_mask & 1<<i) {
+				motors.output_test(i, pwm_high);
+			}
+		}
+        c = cliSerial->read();
+            
+		if (c == 'c') {
+            break;
+
+		} else if (c == 0x03 || c == 0x63 || c == 'q') {
+			cliSerial->printf_P(PSTR("ESC calibration exited\n"));
+			return(0);
+		}
+        
+		/* rate limit to ~ 20 Hz */
+		hal.scheduler->delay(50);
+	}
+
+	cliSerial->printf_P(PSTR("Low PWM set: %d\n"
+	       "\n"
+	       "Hit c+Enter when finished\n"
+	       "\n"), pwm_low);
+
+	while (1) {
+
+		/* set disarmed PWM */
+		for (unsigned i = 0; i < max_channels; i++) {
+			if (set_mask & 1<<i) {
+				motors.output_test(i, pwm_low);
+			}
+		}
+		c = cliSerial->read();
+
+		if (c == 'c') {
+
+			break;
+
+		} else if (c == 0x03 || c == 0x63 || c == 'q') {
+			cliSerial->printf_P(PSTR("ESC calibration exited\n"));
+			return(0);
+		}
+		
+		/* rate limit to ~ 20 Hz */
+		hal.scheduler->delay(50);
+	}
+
+	/* disarm */
+	motors.armed(false);
+    
+	cliSerial->printf_P(PSTR("Outputs disarmed\n"));
+
+	cliSerial->printf_P(PSTR("ESC calibration finished\n"));
+
+	return(0);
+}
+#endif // WITH_ESC_CALIB
+
+
 /***************************************************************************/
 // CLI reports
 /***************************************************************************/
@@ -198,18 +322,13 @@ static void report_batt_monitor()
 {
     cliSerial->printf_P(PSTR("\nBatt Mon:\n"));
     print_divider();
-    if (battery.monitoring() == AP_BATT_MONITOR_DISABLED) print_enabled(false);
-    if (battery.monitoring() == AP_BATT_MONITOR_VOLTAGE_ONLY) cliSerial->printf_P(PSTR("volts"));
-    if (battery.monitoring() == AP_BATT_MONITOR_VOLTAGE_AND_CURRENT) cliSerial->printf_P(PSTR("volts and cur"));
-    print_blanks(2);
-}
-
-static void report_sonar()
-{
-    cliSerial->printf_P(PSTR("Sonar\n"));
-    print_divider();
-    print_enabled(g.sonar_enabled.get());
-    cliSerial->printf_P(PSTR("Type: %d (0=XL, 1=LV, 2=XLL, 3=HRLV)"), (int)g.sonar_type);
+    if (battery.num_instances() == 0) {
+        print_enabled(false);
+    } else if (!battery.has_current()) {
+        cliSerial->printf_P(PSTR("volts"));
+    } else {
+        cliSerial->printf_P(PSTR("volts and cur"));
+    }
     print_blanks(2);
 }
 
@@ -254,45 +373,6 @@ static void report_ins()
     print_blanks(2);
 }
 
-static void report_compass()
-{
-    cliSerial->printf_P(PSTR("Compass\n"));
-    print_divider();
-
-    print_enabled(g.compass_enabled);
-
-    // mag declination
-    cliSerial->printf_P(PSTR("Mag Dec: %4.4f\n"),
-                    degrees(compass.get_declination()));
-
-    Vector3f offsets = compass.get_offsets();
-
-    // mag offsets
-    cliSerial->printf_P(PSTR("Mag off: %4.4f, %4.4f, %4.4f\n"),
-                    offsets.x,
-                    offsets.y,
-                    offsets.z);
-
-    // motor compensation
-    cliSerial->print_P(PSTR("Motor Comp: "));
-    if( compass.motor_compensation_type() == AP_COMPASS_MOT_COMP_DISABLED ) {
-        cliSerial->print_P(PSTR("Off\n"));
-    }else{
-        if( compass.motor_compensation_type() == AP_COMPASS_MOT_COMP_THROTTLE ) {
-            cliSerial->print_P(PSTR("Throttle"));
-        }
-        if( compass.motor_compensation_type() == AP_COMPASS_MOT_COMP_CURRENT ) {
-            cliSerial->print_P(PSTR("Current"));
-        }
-        Vector3f motor_compensation = compass.get_motor_compensation();
-        cliSerial->printf_P(PSTR("\nComp Vec: %4.2f, %4.2f, %4.2f\n"),
-                        motor_compensation.x,
-                        motor_compensation.y,
-                        motor_compensation.z);
-    }
-    print_blanks(1);
-}
-
 static void report_flight_modes()
 {
     cliSerial->printf_P(PSTR("Flight modes\n"));
@@ -310,7 +390,7 @@ void report_optflow()
     cliSerial->printf_P(PSTR("OptFlow\n"));
     print_divider();
 
-    print_enabled(g.optflow_enabled);
+    print_enabled(optflow.enabled());
 
     print_blanks(2);
  #endif     // OPTFLOW == ENABLED
@@ -346,24 +426,6 @@ print_switch(uint8_t p, uint8_t m, bool b)
 }
 
 static void
-print_done()
-{
-    cliSerial->printf_P(PSTR("\nSaved\n"));
-}
-
-
-static void zero_eeprom(void)
-{
-    cliSerial->printf_P(PSTR("\nErasing EEPROM\n"));
-
-    for (uint16_t i = 0; i < EEPROM_MAX_ADDR; i++) {
-        hal.storage->write_byte(i, 0);
-    }
-
-    cliSerial->printf_P(PSTR("done\n"));
-}
-
-static void
 print_accel_offsets_and_scaling(void)
 {
     const Vector3f &accel_offsets = ins.get_accel_offsets();
@@ -388,6 +450,54 @@ print_gyro_offsets(void)
 }
 
 #endif // CLI_ENABLED
+
+// report_compass - displays compass information.  Also called by compassmot.pde
+static void report_compass()
+{
+    cliSerial->printf_P(PSTR("Compass\n"));
+    print_divider();
+
+    print_enabled(g.compass_enabled);
+
+    // mag declination
+    cliSerial->printf_P(PSTR("Mag Dec: %4.4f\n"),
+                    degrees(compass.get_declination()));
+
+    // mag offsets
+    Vector3f offsets;
+    for (uint8_t i=0; i<compass.get_count(); i++) {
+        offsets = compass.get_offsets(i);
+        // mag offsets
+        cliSerial->printf_P(PSTR("Mag%d off: %4.4f, %4.4f, %4.4f\n"),
+                        (int)i,
+                        offsets.x,
+                        offsets.y,
+                        offsets.z);
+    }
+
+    // motor compensation
+    cliSerial->print_P(PSTR("Motor Comp: "));
+    if( compass.get_motor_compensation_type() == AP_COMPASS_MOT_COMP_DISABLED ) {
+        cliSerial->print_P(PSTR("Off\n"));
+    }else{
+        if( compass.get_motor_compensation_type() == AP_COMPASS_MOT_COMP_THROTTLE ) {
+            cliSerial->print_P(PSTR("Throttle"));
+        }
+        if( compass.get_motor_compensation_type() == AP_COMPASS_MOT_COMP_CURRENT ) {
+            cliSerial->print_P(PSTR("Current"));
+        }
+        Vector3f motor_compensation;
+        for (uint8_t i=0; i<compass.get_count(); i++) {
+            motor_compensation = compass.get_motor_compensation(i);
+            cliSerial->printf_P(PSTR("\nComMot%d: %4.2f, %4.2f, %4.2f\n"),
+                        (int)i,
+                        motor_compensation.x,
+                        motor_compensation.y,
+                        motor_compensation.z);
+        }
+    }
+    print_blanks(1);
+}
 
 static void
 print_blanks(int16_t num)
@@ -416,42 +526,9 @@ static void print_enabled(bool b)
     cliSerial->print_P(PSTR("abled\n"));
 }
 
-
-static void
-init_esc()
-{
-    // reduce update rate to motors to 50Hz
-    motors.set_update_rate(50);
-
-    // we enable the motors directly here instead of calling output_min because output_min would send a low signal to the ESC and disrupt the calibration process
-    motors.enable();
-    motors.armed(true);
-    while(1) {
-        read_radio();
-        delay(100);
-        AP_Notify::flags.esc_calibration = true;
-        motors.throttle_pass_through();
-    }
-}
-
 static void report_version()
 {
     cliSerial->printf_P(PSTR("FW Ver: %d\n"),(int)g.k_format_version);
     print_divider();
-    print_blanks(2);
-}
-
-
-static void report_tuning()
-{
-    cliSerial->printf_P(PSTR("\nTUNE:\n"));
-    print_divider();
-    if (g.radio_tuning == 0) {
-        print_enabled(g.radio_tuning.get());
-    }else{
-        float low  = (float)g.radio_tuning_low.get() / 1000;
-        float high = (float)g.radio_tuning_high.get() / 1000;
-        cliSerial->printf_P(PSTR(" %d, Low:%1.4f, High:%1.4f\n"),(int)g.radio_tuning.get(), low, high);
-    }
     print_blanks(2);
 }
